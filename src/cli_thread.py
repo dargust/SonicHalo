@@ -1,5 +1,8 @@
 import threading
 import sys
+import difflib
+
+COMMANDS = ['exit', 'help', 'status', 'hide', 'show']
 
 def command_line_input(visualizer, root):
     while visualizer.running:
@@ -48,6 +51,9 @@ def process_command(command, visualizer, root):
         root.geometry(f"+{x - TRANSPARENT_OFFSET_X}+{y - TRANSPARENT_OFFSET_Y}")
     else:
         print(f"Unknown command: {command}")
+        matches = difflib.get_close_matches(command, COMMANDS, n=1, cutoff=0.6)
+        if matches:
+            print(f"Did you mean: '{matches[0]}'?")
 
 def start_command_line_thread(visualizer, root):
     thread = threading.Thread(target=command_line_input, args=(visualizer, root,), daemon=True)

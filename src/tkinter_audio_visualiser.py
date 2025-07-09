@@ -7,6 +7,7 @@ import colorsys
 import asyncio
 import sys
 import cli_thread  # Import the CLI thread module
+import ctypes
 
 print(f"System platform: {sys.platform}")
 ON_WINDOWS = sys.platform.startswith('win')
@@ -90,9 +91,17 @@ class AudioVisualizer(tk.Canvas):
         self.highlighted_bar_target = None
         self.highlighted_bar_speed = 0.10
         self.is_harmonic = False
+        self.freq_marker_id = None
+        self.freq_marker_x = None
+        self.freq_marker_target_x = None
+        self.freq_marker_speed = 0.12  # Smoothing factor
+        self.band_centers = None  # Will be set externally
 
     def set_amplitudes(self, amps):
         self.amps = amps
+
+    def set_band_centers(self, band_centers):
+        self.band_centers = band_centers
 
     def set_highlighted_bar(self, index):
         self.highlighted_bar_target = index
@@ -101,6 +110,26 @@ class AudioVisualizer(tk.Canvas):
 
     def set_harmonic(self, value):
         self.is_harmonic = value
+
+    def set_highlighted_freq(self, freq):
+        if self.band_centers is None or freq is None:
+            self.freq_marker_target_x = None
+            return
+
+        min_freq = self.band_centers[0]
+        max_freq = self.band_centers[-1]
+        width = self.winfo_width()
+        low_bias = 0.8  # Must match your get_weighted_band_edges call!
+
+        # Invert the weighted log formula to get t for a given freq
+        log_ratio = np.log(max_freq / min_freq)
+        t = np.log(freq / min_freq) / log_ratio
+        t_weighted = t ** (1 / low_bias)
+        bar_x = t_weighted * width
+
+        self.freq_marker_target_x = bar_x
+        if self.freq_marker_x is None:
+            self.freq_marker_x = self.freq_marker_target_x
 
     def update_bars(self):
         if self.highlighted_bar_target is not None:
@@ -146,6 +175,24 @@ class AudioVisualizer(tk.Canvas):
             hex_color = f'#{r:02x}{g:02x}{b:02x}'
 
             self.itemconfig(self.bars[i], fill=hex_color)
+
+        # --- Frequency marker update ---
+        if self.freq_marker_target_x is not None:
+            if self.freq_marker_x is None:
+                self.freq_marker_x = self.freq_marker_target_x
+            else:
+                self.freq_marker_x += (self.freq_marker_target_x - self.freq_marker_x) * self.freq_marker_speed
+            x = self.freq_marker_x
+            y = self.winfo_height() - 12
+            r = 5
+            if self.freq_marker_id is None:
+                self.freq_marker_id = self.create_oval(x - r, y - r, x + r, y + r, fill="#fff", outline="#222", width=2)
+            else:
+                self.coords(self.freq_marker_id, x - r, y - r, x + r, y + r)
+                self.itemconfig(self.freq_marker_id, state="normal")
+        else:
+            if self.freq_marker_id is not None:
+                self.itemconfig(self.freq_marker_id, state="hidden")
 
         if self.running:
             self.after(UPDATE_INTERVAL, self.update_bars)
@@ -218,6 +265,26 @@ def audio_thread(visualizer):
                 loudest_idx = None
         visualizer.set_amplitudes(amps)
         visualizer.set_highlighted_bar(loudest_idx)
+
+        # After calculating band_centers and loudest_idx
+        visualizer.set_band_centers(band_centers)
+
+        # Find the true FFT peak frequency in the vocal range
+        if loudest_idx is not None:
+            # Get the frequency range for the loudest band
+            band_start = band_edges[loudest_idx]
+            band_end = band_edges[loudest_idx + 1]
+            # Find FFT bins within this band
+            bins_in_band = np.where((freqs >= band_start) & (freqs < band_end))[0]
+            if len(bins_in_band) > 0:
+                peak_bin = bins_in_band[np.argmax(fft[bins_in_band])]
+                highlighted_freq = freqs[peak_bin]
+            else:
+                highlighted_freq = band_centers[loudest_idx]
+        else:
+            highlighted_freq = None
+
+        visualizer.set_highlighted_freq(highlighted_freq)
 
         if USE_HARMONIC_CHECK:
             if loudest_idx is not None:
@@ -319,6 +386,20 @@ def main():
     TRANSPARENT_OFFSET_X = 8
     TRANSPARENT_OFFSET_Y = 30
 
+    def make_window_clickthrough(root):
+        root.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        styles = 0x80000 | 0x20
+        old_style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+        ctypes.windll.user32.SetWindowLongW(hwnd, -20, old_style | styles)
+
+    def remove_window_clickthrough(root):
+        root.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        old_style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+        # Remove WS_EX_TRANSPARENT
+        ctypes.windll.user32.SetWindowLongW(hwnd, -20, old_style & ~0x20)
+
     def make_transparent(event=None):
         x, y = root.winfo_x(), root.winfo_y()
         if not transparent["state"]:
@@ -327,6 +408,7 @@ def main():
             root.config(bg='black')
             visualizer.config(bg='black')
             root.geometry(f"+{x + TRANSPARENT_OFFSET_X}+{y + TRANSPARENT_OFFSET_Y}")
+            make_window_clickthrough(root)
             transparent["state"] = True
         else:
             root.overrideredirect(False)
@@ -334,6 +416,7 @@ def main():
             root.config(bg='black')
             visualizer.config(bg='black')
             root.geometry(f"+{x - TRANSPARENT_OFFSET_X}+{y - TRANSPARENT_OFFSET_Y}")
+            remove_window_clickthrough(root)
             transparent["state"] = False
 
     def on_close():
