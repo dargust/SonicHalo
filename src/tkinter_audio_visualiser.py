@@ -6,7 +6,7 @@ import time
 import colorsys
 import asyncio
 import sys
-import cli_thread  # Import the CLI thread module
+import cli_thread
 import ctypes
 
 print(f"System platform: {sys.platform}")
@@ -18,11 +18,11 @@ if ON_WINDOWS:
         from winsdk.windows.media.control import \
             GlobalSystemMediaTransportControlsSessionManager as MediaManager
     except ImportError:
-        MediaManager = None  # Handle gracefully if not available
+        MediaManager = None
 else:
     MediaManager = None
 
-# Parameters
+# Params
 BAR_COUNT = 36
 BAR_WIDTH = 16
 BAR_SPACING = 5
@@ -48,9 +48,8 @@ def get_weighted_band_edges(min_freq, max_freq, band_count, low_bias=2.5):
     Returns band edges with more density in the lows.
     low_bias > 1.0 means more bands in the lows, 1.0 is pure logspace.
     """
-    # t goes from 0 to 1
     t = np.linspace(0, 1, band_count + 1)
-    # Apply a power curve to bias toward low frequencies
+    # bias toward low frequencies
     t_weighted = t ** low_bias
     band_edges = min_freq * (max_freq / min_freq) ** t_weighted
     return band_edges
@@ -95,7 +94,7 @@ class AudioVisualizer(tk.Canvas):
         self.freq_marker_x = None
         self.freq_marker_target_x = None
         self.freq_marker_speed = 0.12  # Smoothing factor
-        self.band_centers = None  # Will be set externally
+        self.band_centers = None
 
     def set_amplitudes(self, amps):
         self.amps = amps
@@ -119,7 +118,7 @@ class AudioVisualizer(tk.Canvas):
         min_freq = self.band_centers[0]
         max_freq = self.band_centers[-1]
         width = self.winfo_width()
-        low_bias = 0.8  # Must match your get_weighted_band_edges call!
+        low_bias = 0.8 # Adjust here
 
         # Invert the weighted log formula to get t for a given freq
         log_ratio = np.log(max_freq / min_freq)
@@ -140,7 +139,6 @@ class AudioVisualizer(tk.Canvas):
                     self.highlighted_bar_target - self.highlighted_bar_pos
                 ) * self.highlighted_bar_speed
         elif self.highlighted_bar_pos is not None:
-            # Instead of drifting to 0, just clear the highlight
             self.highlighted_bar_pos = None
 
         for i, target in enumerate(self.amps):
@@ -265,8 +263,6 @@ def audio_thread(visualizer):
                 loudest_idx = None
         visualizer.set_amplitudes(amps)
         visualizer.set_highlighted_bar(loudest_idx)
-
-        # After calculating band_centers and loudest_idx
         visualizer.set_band_centers(band_centers)
 
         # Find the true FFT peak frequency in the vocal range
@@ -397,7 +393,6 @@ def main():
         root.update_idletasks()
         hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
         old_style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
-        # Remove WS_EX_TRANSPARENT
         ctypes.windll.user32.SetWindowLongW(hwnd, -20, old_style & ~0x20)
 
     def make_transparent(event=None):
