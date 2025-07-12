@@ -60,8 +60,13 @@ if DEVICE_INDEX is None:
 
 class AudioVisualizer(tk.Canvas):
     def __init__(self, master, **kwargs):
-        width = BAR_COUNT * (BAR_WIDTH + BAR_SPACING)
-        height = BAR_MAX_HEIGHT + 20
+        self.ring_radius = 65  # Size of the ring
+        self.bar_length_max = 100  # How far bars can extend from the ring
+        self.bar_width = 10
+        self.center_x = self.ring_radius + self.bar_length_max + 30
+        self.center_y = self.ring_radius + self.bar_length_max + 30
+        width = self.center_x * 2
+        height = self.center_y * 2
         super().__init__(
             master,
             width=width,
@@ -70,31 +75,32 @@ class AudioVisualizer(tk.Canvas):
             highlightthickness=0,
             **kwargs
         )
-        self.bar_positions = [
-            (i * (BAR_WIDTH + BAR_SPACING), i * (BAR_WIDTH + BAR_SPACING) + BAR_WIDTH)
-            for i in range(BAR_COUNT)
-        ]
-        self.bars = [self.create_rectangle(
-            x0, height, x1, height,
-            fill='lime', outline='') for x0, x1 in self.bar_positions]
+        self.pack()
+        self.running = True
+        self.after(UPDATE_INTERVAL, self.update_bars)
         self.amps = np.zeros(BAR_COUNT)
         self.display_amps = np.zeros(BAR_COUNT)
         self.fall_velocity = np.zeros(BAR_COUNT)
         self.fall_acceleration = 0.006
         self.fall_speed_min = 0.01
-        self.pack()
-        self.running = True
-        self.after(UPDATE_INTERVAL, self.update_bars)
         self.highlighted_bar = None
         self.highlighted_bar_pos = None
         self.highlighted_bar_target = None
         self.highlighted_bar_speed = 0.10
         self.is_harmonic = False
-        self.freq_marker_id = None
-        self.freq_marker_x = None
-        self.freq_marker_target_x = None
-        self.freq_marker_speed = 0.12  # Smoothing factor
         self.band_centers = None
+        # Create bar objects (lines)
+        self.bars = [self.create_line(0,0,0,0, width=self.bar_width, fill='lime') for _ in range(BAR_COUNT)]
+        # Draw the ring
+        #self.ring_id = self.create_oval(
+        #    self.center_x - self.ring_radius, self.center_y - self.ring_radius,
+        #    self.center_x + self.ring_radius, self.center_y + self.ring_radius,
+        #    outline="#444", width=6
+        #)
+        self.freq_marker_id = None
+        self.freq_marker_angle = None
+        self.freq_marker_target_angle = None
+        self.freq_marker_speed = 0.12
 
     def set_amplitudes(self, amps):
         self.amps = amps
@@ -112,25 +118,22 @@ class AudioVisualizer(tk.Canvas):
 
     def set_highlighted_freq(self, freq):
         if self.band_centers is None or freq is None:
-            self.freq_marker_target_x = None
+            self.freq_marker_target_angle = None
             return
-
+        # Map freq to angle
         min_freq = self.band_centers[0]
         max_freq = self.band_centers[-1]
-        width = self.winfo_width()
-        low_bias = 0.8 # Adjust here
-
-        # Invert the weighted log formula to get t for a given freq
+        low_bias = 0.8
         log_ratio = np.log(max_freq / min_freq)
         t = np.log(freq / min_freq) / log_ratio
         t_weighted = t ** (1 / low_bias)
-        bar_x = t_weighted * width
-
-        self.freq_marker_target_x = bar_x
-        if self.freq_marker_x is None:
-            self.freq_marker_x = self.freq_marker_target_x
+        angle = t_weighted * 2 * np.pi + np.pi  # Start from left side
+        self.freq_marker_target_angle = angle
+        if self.freq_marker_angle is None:
+            self.freq_marker_angle = angle
 
     def update_bars(self):
+        # Animate highlighted bar
         if self.highlighted_bar_target is not None:
             if self.highlighted_bar_pos is None:
                 self.highlighted_bar_pos = float(self.highlighted_bar_target)
@@ -141,48 +144,56 @@ class AudioVisualizer(tk.Canvas):
         elif self.highlighted_bar_pos is not None:
             self.highlighted_bar_pos = None
 
+        # Animate amplitudes
+        MIN_BAR_VALUE = 0.05  # Minimum bar amplitude (0-1 scale)
         for i, target in enumerate(self.amps):
             current = self.display_amps[i]
             if target > current:
-                self.display_amps[i] = target
+                self.display_amps[i] = max(target, MIN_BAR_VALUE)
                 self.fall_velocity[i] = 0.00
             else:
                 self.fall_velocity[i] += self.fall_acceleration
                 fall_amount = max(self.fall_speed_min, self.fall_velocity[i])
-                self.display_amps[i] = max(0, current - fall_amount)
-            x0, x1 = self.bar_positions[i]
-            y1 = self.winfo_height()
-            y0 = y1 - int(self.display_amps[i] * BAR_MAX_HEIGHT)
-            coords = self.coords(self.bars[i])
-            if coords != [x0, y0, x1, y1]:
-                self.coords(self.bars[i], x0, y0, x1, y1)
+                self.display_amps[i] = max(MIN_BAR_VALUE if current > 0 else 0, current - fall_amount)
+
+        # Draw bars around the ring
+        # Smooth the wrap by averaging the first and second-to-last bar for the last bar
+        if BAR_COUNT > 2:
+            self.display_amps[-1] = (self.display_amps[0] + self.display_amps[-2]) / 2
+
+        for i in range(BAR_COUNT):
             value = min(max(self.display_amps[i], 0), 1)
+            angle = (2 * np.pi * i) / BAR_COUNT + np.pi  # Start from left side
+            x0 = self.center_x + self.ring_radius * np.cos(angle)
+            y0 = self.center_y + self.ring_radius * np.sin(angle)
+            x1 = self.center_x + (self.ring_radius + value * self.bar_length_max) * np.cos(angle)
+            y1 = self.center_y + (self.ring_radius + value * self.bar_length_max) * np.sin(angle)
+            # Color logic
             hue = 0.33 * (1 - value)
             rgb = colorsys.hsv_to_rgb(hue, 1.0, 0.7)
             base_r, base_g, base_b = [int(255 * c) for c in rgb]
-
             blue_strength = 0
             if self.is_harmonic and self.highlighted_bar_pos is not None:
                 dist = abs(i - self.highlighted_bar_pos)
                 if dist < 1.5:
                     blue_strength = int(255 * (1 - dist / 1.5))
-
             r = min(base_r, 255)
             g = min(base_g, 255)
             b = min(base_b + blue_strength, 255)
             hex_color = f'#{r:02x}{g:02x}{b:02x}'
-
+            self.coords(self.bars[i], x0, y0, x1, y1)
             self.itemconfig(self.bars[i], fill=hex_color)
 
         # --- Frequency marker update ---
-        if self.freq_marker_target_x is not None:
-            if self.freq_marker_x is None:
-                self.freq_marker_x = self.freq_marker_target_x
+        if self.freq_marker_target_angle is not None:
+            if self.freq_marker_angle is None:
+                self.freq_marker_angle = self.freq_marker_target_angle
             else:
-                self.freq_marker_x += (self.freq_marker_target_x - self.freq_marker_x) * self.freq_marker_speed
-            x = self.freq_marker_x
-            y = self.winfo_height() - 12
-            r = 5
+                self.freq_marker_angle += (self.freq_marker_target_angle - self.freq_marker_angle) * self.freq_marker_speed
+            angle = self.freq_marker_angle
+            x = self.center_x + (self.ring_radius + 15) * np.cos(angle) # + self.bar_length_max + 15) * np.cos(angle)
+            y = self.center_y + (self.ring_radius + 15) * np.sin(angle) # + self.bar_length_max + 15) * np.sin(angle)
+            r = 8
             if self.freq_marker_id is None:
                 self.freq_marker_id = self.create_oval(x - r, y - r, x + r, y + r, fill="#fff", outline="#222", width=2)
             else:
