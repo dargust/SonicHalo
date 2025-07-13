@@ -23,14 +23,15 @@ else:
     MediaManager = None
 
 # Params
+RING_RADIUS = 50  # Size of the ring
 BAR_COUNT = 36
-BAR_WIDTH = 16
-BAR_SPACING = 5
-BAR_MAX_HEIGHT = 200
+BAR_WIDTH = 8
+BAR_MAX_HEIGHT = 80
 UPDATE_INTERVAL = 16  # ms
 SAMPLE_RATE = 44100
 CHUNK = 512
 USE_HARMONIC_CHECK = True
+MIN_BAR_VALUE = 0.08  # Minimum bar amplitude (0-1 scale)
 
 # Automatically select the desired audio device
 def find_cable_output_device():
@@ -60,9 +61,9 @@ if DEVICE_INDEX is None:
 
 class AudioVisualizer(tk.Canvas):
     def __init__(self, master, **kwargs):
-        self.ring_radius = 65  # Size of the ring
-        self.bar_length_max = 100  # How far bars can extend from the ring
-        self.bar_width = 10
+        self.ring_radius = RING_RADIUS  # Size of the ring
+        self.bar_length_max = BAR_MAX_HEIGHT  # How far bars can extend from the ring
+        self.bar_width = BAR_WIDTH
         self.center_x = self.ring_radius + self.bar_length_max + 30
         self.center_y = self.ring_radius + self.bar_length_max + 30
         width = self.center_x * 2
@@ -91,6 +92,7 @@ class AudioVisualizer(tk.Canvas):
         self.band_centers = None
         # Create bar objects (lines)
         self.bars = [self.create_line(0,0,0,0, width=self.bar_width, fill='lime') for _ in range(BAR_COUNT)]
+
         # Draw the ring
         #self.ring_id = self.create_oval(
         #    self.center_x - self.ring_radius, self.center_y - self.ring_radius,
@@ -103,6 +105,7 @@ class AudioVisualizer(tk.Canvas):
         self.freq_marker_speed = 0.12
         self.rotation_offset = 0.0
         self.rotation_speed = 0.005  # Adjust for desired speed
+        print(f"Visualizer initialized with {BAR_COUNT} bars, ring radius {self.ring_radius}, max bar length {self.bar_length_max}")
 
     def set_amplitudes(self, amps):
         self.amps = amps
@@ -147,7 +150,6 @@ class AudioVisualizer(tk.Canvas):
             self.highlighted_bar_pos = None
 
         # Animate amplitudes
-        MIN_BAR_VALUE = 0.05  # Minimum bar amplitude (0-1 scale)
         for i, target in enumerate(self.amps):
             current = self.display_amps[i]
             if target > current:
@@ -335,6 +337,7 @@ def audio_thread(visualizer):
     with sd.InputStream(device=DEVICE_INDEX, channels=2, samplerate=SAMPLE_RATE, blocksize=CHUNK, callback=callback):
         while visualizer.running:
             sd.sleep(UPDATE_INTERVAL)
+    
 
 async def poll_song_change(callback, poll_interval=2):
     last_song = None
@@ -370,11 +373,13 @@ def main():
     song_label.lower()
 
     dacus_label = tk.Label(root, text="Dacus", fg="white", bg="black", font=("Fixedsys", 12), borderwidth=0, padx=0, pady=0)
-    dacus_label.place(relx=0.0125, rely=0.97, anchor="sw")
+    dacus_label.place(relx=0.5, rely=0.62, anchor="center")
     dacus_label.lift()
 
     def show_song(song):
-        max_chars = 48
+        # Work out max chars based on window width and text character width
+        max_chars = root.winfo_width() // 8
+        #max_chars = 48
         song_label.update_idletasks()
         label_width = song_label.winfo_width()
         window_width = root.winfo_width()
@@ -458,6 +463,7 @@ def main():
     # Start the CLI thread for command input
     cli_thread.start_command_line_thread(visualizer, root)
 
+    print("Main loop starting...")
     root.mainloop()
 
 if __name__ == "__main__":

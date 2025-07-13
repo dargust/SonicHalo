@@ -33,10 +33,10 @@ def analyze_fft_frames(fft_frames: np.ndarray, freqs: np.ndarray = None):
     peak_freq = freqs[peak_idx] if freqs is not None else peak_idx
 
     shape_params = {
-        'radius': np.clip(total_energy / 10000, 0.1, 2.0),
-        'spikiness': np.clip(high_ratio * 5 + flux * 10, 0, 10),
+        'radius': np.clip(total_energy / 1, 0.1, 2.0),
+        'spikiness': np.clip(high_ratio * 5 + flux * 10, 0, 2),
         'roundness': 1.0 - flatness,
-        'rotation_speed': np.clip(peak_freq / 1000, 0.1, 2.0),
+        'rotation_speed': np.clip(peak_freq / 1000, 0.1, 0.2),
         'color_hue': (spectral_centroid or peak_freq) % 360,
         'bass_bulge': low_ratio,
         'mid_wave': mid_ratio,
@@ -89,7 +89,6 @@ def draw_audio_shape(canvas, shape_params, center_x, center_y, base_radius=100, 
     canvas.create_polygon(points, fill=fill_color, outline="", tags="visual")
     return (rotation_angle + rotation_speed * 0.03) % (2 * math.pi)
 
-
 # === SIMULATION + LOOP ===
 def update_visual():
     global rotation_angle, fft_frames
@@ -103,7 +102,7 @@ def update_visual():
     freqs = np.linspace(20, 2000, N_BINS)  # Simulated frequency bins
     shape_params = analyze_fft_frames(frames_np, freqs)
 
-    rotation_angle = draw_audio_shape(canvas, shape_params, 250, 250, rotation_angle=rotation_angle)
+    rotation_angle = draw_disconnected_shapes(canvas, shape_params, 100, 100)
     root.after(33, update_visual)
 
 if __name__ == "__main__":

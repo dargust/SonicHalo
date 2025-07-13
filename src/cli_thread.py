@@ -151,4 +151,5 @@ def process_command(command, visualizer, root):
 
 def start_command_line_thread(visualizer, root):
     thread = threading.Thread(target=command_line_input, args=(visualizer, root,), daemon=True)
+    print("Starting command line input thread...")
     thread.start()
