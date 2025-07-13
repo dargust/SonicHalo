@@ -101,6 +101,8 @@ class AudioVisualizer(tk.Canvas):
         self.freq_marker_angle = None
         self.freq_marker_target_angle = None
         self.freq_marker_speed = 0.12
+        self.rotation_offset = 0.0
+        self.rotation_speed = 0.005  # Adjust for desired speed
 
     def set_amplitudes(self, amps):
         self.amps = amps
@@ -156,14 +158,33 @@ class AudioVisualizer(tk.Canvas):
                 fall_amount = max(self.fall_speed_min, self.fall_velocity[i])
                 self.display_amps[i] = max(MIN_BAR_VALUE if current > 0 else 0, current - fall_amount)
 
+        # --- Add rotation ---
+        # set rotation speed using multiplied bass frequencies
+        # Typically, bass is in the first few bars (e.g., indices 0-3)
+        bass_indices = np.arange(0, min(4, BAR_COUNT))
+        selected_values = self.amps[bass_indices]
+        self.rotation_speed = min(np.prod(selected_values)*0.3, 0.045) + 0.005
+        #print(self.rotation_speed)
+        self.rotation_offset += self.rotation_speed
+        if self.rotation_offset > 2 * np.pi:
+            self.rotation_offset -= 2 * np.pi
+
         # Draw bars around the ring
         # Smooth the wrap by averaging the first and second-to-last bar for the last bar
         if BAR_COUNT > 2:
             self.display_amps[-1] = (self.display_amps[0] + self.display_amps[-2]) / 2
 
         for i in range(BAR_COUNT):
-            value = min(max(self.display_amps[i], 0), 1)
-            angle = (2 * np.pi * i) / BAR_COUNT + np.pi  # Start from left side
+            # Calculate fractional index shift
+            shift = self.rotation_offset * BAR_COUNT / (2 * np.pi)
+            shifted_index = (i + shift) % BAR_COUNT
+            idx0 = int(np.floor(shifted_index))
+            idx1 = (idx0 + 1) % BAR_COUNT
+            frac = shifted_index - idx0
+            # Linear interpolation
+            value = (1 - frac) * self.display_amps[idx0] + frac * self.display_amps[idx1]
+            value = min(max(value, 0), 1)
+            angle = (2 * np.pi * i) / BAR_COUNT + np.pi + self.rotation_offset
             x0 = self.center_x + self.ring_radius * np.cos(angle)
             y0 = self.center_y + self.ring_radius * np.sin(angle)
             x1 = self.center_x + (self.ring_radius + value * self.bar_length_max) * np.cos(angle)
@@ -174,7 +195,7 @@ class AudioVisualizer(tk.Canvas):
             base_r, base_g, base_b = [int(255 * c) for c in rgb]
             blue_strength = 0
             if self.is_harmonic and self.highlighted_bar_pos is not None:
-                dist = abs(i - self.highlighted_bar_pos)
+                dist = abs(shifted_index - self.highlighted_bar_pos)
                 if dist < 1.5:
                     blue_strength = int(255 * (1 - dist / 1.5))
             r = min(base_r, 255)
@@ -191,11 +212,11 @@ class AudioVisualizer(tk.Canvas):
             else:
                 self.freq_marker_angle += (self.freq_marker_target_angle - self.freq_marker_angle) * self.freq_marker_speed
             angle = self.freq_marker_angle
-            x = self.center_x + (self.ring_radius + 15) * np.cos(angle) # + self.bar_length_max + 15) * np.cos(angle)
-            y = self.center_y + (self.ring_radius + 15) * np.sin(angle) # + self.bar_length_max + 15) * np.sin(angle)
-            r = 8
+            x = self.center_x + (self.ring_radius + 10) * np.cos(angle) # + self.bar_length_max + 15) * np.cos(angle)
+            y = self.center_y + (self.ring_radius + 10) * np.sin(angle) # + self.bar_length_max + 15) * np.sin(angle)
+            r = 4
             if self.freq_marker_id is None:
-                self.freq_marker_id = self.create_oval(x - r, y - r, x + r, y + r, fill="#fff", outline="#222", width=2)
+                self.freq_marker_id = self.create_oval(x - r, y - r, x + r, y + r, fill="#000", outline="#222", width=0)
             else:
                 self.coords(self.freq_marker_id, x - r, y - r, x + r, y + r)
                 self.itemconfig(self.freq_marker_id, state="normal")
@@ -338,14 +359,14 @@ async def poll_song_change(callback, poll_interval=2):
 
 def main():
     root = tk.Tk()
-    root.title("Live Audio Visualizer")
+    root.title("Live Audio Visualizer 👾")
     root.config(bg='black')
     root.wm_attributes('-topmost', True)
     visualizer = AudioVisualizer(root)
 
     song_var = tk.StringVar()
-    song_label = tk.Label(root, textvariable=song_var, fg="white", bg="black", font=("Fixedsys", 17))
-    song_label.place(relx=0.5, rely=0.7, anchor="center")
+    song_label = tk.Label(root, textvariable=song_var, fg="white", bg="black", font=("Fixedsys", 16))
+    song_label.place(relx=0.5, rely=0.5, anchor="center")
     song_label.lower()
 
     dacus_label = tk.Label(root, text="Dacus", fg="white", bg="black", font=("Fixedsys", 12), borderwidth=0, padx=0, pady=0)
@@ -353,7 +374,7 @@ def main():
     dacus_label.lift()
 
     def show_song(song):
-        max_chars = 40
+        max_chars = 48
         song_label.update_idletasks()
         label_width = song_label.winfo_width()
         window_width = root.winfo_width()
