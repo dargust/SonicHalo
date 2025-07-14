@@ -108,29 +108,6 @@ def process_command(command, visualizer, root):
             elif param == "highlighted_bar_speed":
                 visualizer.highlighted_bar_speed = float(value)
                 print(f"Set highlighted_bar_speed to {value}")
-            elif param == "bar_count":
-                from tkinter_audio_visualiser import BAR_WIDTH, BAR_SPACING, BAR_MAX_HEIGHT
-                # Recreate bars (simple approach, may need to restart for full effect)
-                try:
-                    new_count = int(value)
-                    visualizer.delete("all")
-                    visualizer.bar_positions = [
-                        (i * (BAR_WIDTH + BAR_SPACING), i * (BAR_WIDTH + BAR_SPACING) + BAR_WIDTH)
-                        for i in range(new_count)
-                    ]
-                    visualizer.bars = [visualizer.create_rectangle(
-                        x0, BAR_MAX_HEIGHT + 20, x1, BAR_MAX_HEIGHT + 20,
-                        fill='lime', outline='') for x0, x1 in visualizer.bar_positions]
-                    visualizer.amps = np.zeros(new_count)
-                    visualizer.display_amps = np.zeros(new_count)
-                    visualizer.fall_velocity = np.zeros(new_count)
-                    print(f"Set bar_count to {new_count} (restart may be required for full effect)")
-                except Exception as e:
-                    print(f"Error setting bar_count: {e}")
-            elif param == "bar_max_height":
-                from tkinter_audio_visualiser import BAR_COUNT
-                visualizer.config(height=int(value) + 20)
-                print(f"Set bar_max_height to {value}")
             elif param == "log_bias":
                 # You must store and use this value in your get_weighted_band_edges call!
                 visualizer.log_bias = float(value)
@@ -150,6 +127,9 @@ def process_command(command, visualizer, root):
             print(f"Did you mean: '{matches[0]}'?")
 
 def start_command_line_thread(visualizer, root):
+    # delay starting the command line thread to ensure the visualizer is initialized
+    import time
+    time.sleep(1)  # Wait for the visualizer to initialize
     thread = threading.Thread(target=command_line_input, args=(visualizer, root,), daemon=True)
     print("Starting command line input thread...")
     thread.start()

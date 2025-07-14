@@ -22,7 +22,7 @@ if ON_WINDOWS:
 else:
     MediaManager = None
 
-# Params
+# Params {defaults}
 RING_RADIUS = 50  # Size of the ring
 BAR_COUNT = 36
 BAR_WIDTH = 8
@@ -31,7 +31,9 @@ UPDATE_INTERVAL = 16  # ms
 SAMPLE_RATE = 44100
 CHUNK = 512
 USE_HARMONIC_CHECK = True
-MIN_BAR_VALUE = 0.08  # Minimum bar amplitude (0-1 scale)
+MIN_BAR_VALUE = 0.05  # Minimum bar amplitude (0-1 scale)
+MARKER_OFFSET = 10
+MARKER_RADIUS = 4
 
 # Automatically select the desired audio device
 def find_cable_output_device():
@@ -214,9 +216,9 @@ class AudioVisualizer(tk.Canvas):
             else:
                 self.freq_marker_angle += (self.freq_marker_target_angle - self.freq_marker_angle) * self.freq_marker_speed
             angle = self.freq_marker_angle
-            x = self.center_x + (self.ring_radius + 10) * np.cos(angle) # + self.bar_length_max + 15) * np.cos(angle)
-            y = self.center_y + (self.ring_radius + 10) * np.sin(angle) # + self.bar_length_max + 15) * np.sin(angle)
-            r = 4
+            x = self.center_x + (self.ring_radius + MARKER_OFFSET) * np.cos(angle) # + self.bar_length_max + 15) * np.cos(angle)
+            y = self.center_y + (self.ring_radius + MARKER_OFFSET) * np.sin(angle) # + self.bar_length_max + 15) * np.sin(angle)
+            r = MARKER_RADIUS
             if self.freq_marker_id is None:
                 self.freq_marker_id = self.create_oval(x - r, y - r, x + r, y + r, fill="#000", outline="#222", width=0)
             else:
@@ -360,11 +362,20 @@ async def poll_song_change(callback, poll_interval=2):
                     callback(song)
         await asyncio.sleep(poll_interval)
 
-def main():
+def main(big=False):
+    global RING_RADIUS, BAR_WIDTH, BAR_MAX_HEIGHT, MIN_BAR_VALUE, MARKER_OFFSET, MARKER_RADIUS
     root = tk.Tk()
     root.title("Live Audio Visualizer 👾")
     root.config(bg='black')
     root.wm_attributes('-topmost', True)
+    if big:
+        # Params {big vis}
+        RING_RADIUS = 150
+        BAR_WIDTH = 24
+        BAR_MAX_HEIGHT = 400
+        MIN_BAR_VALUE = 0.03
+        MARKER_OFFSET = 20
+        MARKER_RADIUS = 10
     visualizer = AudioVisualizer(root)
 
     song_var = tk.StringVar()
@@ -372,9 +383,11 @@ def main():
     song_label.place(relx=0.5, rely=0.5, anchor="center")
     song_label.lower()
 
-    dacus_label = tk.Label(root, text="Dacus", fg="white", bg="black", font=("Fixedsys", 12), borderwidth=0, padx=0, pady=0)
-    dacus_label.place(relx=0.5, rely=0.62, anchor="center")
-    dacus_label.lift()
+    dacus_label_offset = 10 if not big else 20
+    visualizer.create_text(
+        visualizer.center_x, visualizer.center_y + visualizer.ring_radius + dacus_label_offset,
+        text="DACUS", fill="black", font=("Fixedsys", 16), anchor="center"
+    )
 
     def show_song(song):
         # Work out max chars based on window width and text character width
@@ -467,4 +480,11 @@ def main():
     root.mainloop()
 
 if __name__ == "__main__":
-    main()
+    # use command line arguments to set the size
+    big = False
+    if len(sys.argv) > 1:
+        cmd_input = sys.argv[1]
+        print(f"Command line argument: {cmd_input}")
+        if sys.argv[1] == "big":
+            big = True
+    main(big)
