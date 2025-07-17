@@ -34,6 +34,7 @@ USE_HARMONIC_CHECK = True
 MIN_BAR_VALUE = 0.05  # Minimum bar amplitude (0-1 scale)
 MARKER_OFFSET = 10
 MARKER_RADIUS = 4
+TYPE = "ringout"  # Default type of visualizer
 
 # Automatically select the desired audio device
 def find_cable_output_device():
@@ -172,42 +173,56 @@ class AudioVisualizer(tk.Canvas):
         self.rotation_offset += self.rotation_speed
         if self.rotation_offset > 2 * np.pi:
             self.rotation_offset -= 2 * np.pi
+        if TYPE.startswith("ring"):
+            # Draw bars around the ring
+            # Smooth the wrap by averaging the first and second-to-last bar for the last bar
+            if BAR_COUNT > 2:
+                self.display_amps[-1] = (self.display_amps[0] + self.display_amps[-2]) / 2
 
-        # Draw bars around the ring
-        # Smooth the wrap by averaging the first and second-to-last bar for the last bar
-        if BAR_COUNT > 2:
-            self.display_amps[-1] = (self.display_amps[0] + self.display_amps[-2]) / 2
+            for i in range(BAR_COUNT):
+                # Calculate fractional index shift
+                shift = self.rotation_offset * BAR_COUNT / (2 * np.pi)
+                shifted_index = (i + shift) % BAR_COUNT
+                idx0 = int(np.floor(shifted_index))
+                idx1 = (idx0 + 1) % BAR_COUNT
+                frac = shifted_index - idx0
+                # Linear interpolation
+                value = (1 - frac) * self.display_amps[idx0] + frac * self.display_amps[idx1]
+                value = min(max(value, 0), 1)
+                angle = (2 * np.pi * i) / BAR_COUNT + np.pi + self.rotation_offset
+                if TYPE.endswith("out"):
+                    x0 = self.center_x + self.ring_radius * np.cos(angle)
+                    y0 = self.center_y + self.ring_radius * np.sin(angle)
+                    x1 = self.center_x + (self.ring_radius + value * self.bar_length_max) * np.cos(angle)
+                    y1 = self.center_y + (self.ring_radius + value * self.bar_length_max) * np.sin(angle)
+                elif TYPE.endswith("in"):
+                    bar_len = value * self.bar_length_max
 
-        for i in range(BAR_COUNT):
-            # Calculate fractional index shift
-            shift = self.rotation_offset * BAR_COUNT / (2 * np.pi)
-            shifted_index = (i + shift) % BAR_COUNT
-            idx0 = int(np.floor(shifted_index))
-            idx1 = (idx0 + 1) % BAR_COUNT
-            frac = shifted_index - idx0
-            # Linear interpolation
-            value = (1 - frac) * self.display_amps[idx0] + frac * self.display_amps[idx1]
-            value = min(max(value, 0), 1)
-            angle = (2 * np.pi * i) / BAR_COUNT + np.pi + self.rotation_offset
-            x0 = self.center_x + self.ring_radius * np.cos(angle)
-            y0 = self.center_y + self.ring_radius * np.sin(angle)
-            x1 = self.center_x + (self.ring_radius + value * self.bar_length_max) * np.cos(angle)
-            y1 = self.center_y + (self.ring_radius + value * self.bar_length_max) * np.sin(angle)
-            # Color logic
-            hue = 0.33 * (1 - value)
-            rgb = colorsys.hsv_to_rgb(hue, 1.0, 0.7)
-            base_r, base_g, base_b = [int(255 * c) for c in rgb]
-            blue_strength = 0
-            if self.is_harmonic and self.highlighted_bar_pos is not None:
-                dist = abs(shifted_index - self.highlighted_bar_pos)
-                if dist < 1.5:
-                    blue_strength = int(255 * (1 - dist / 1.5))
-            r = min(base_r, 255)
-            g = min(base_g, 255)
-            b = min(base_b + blue_strength, 255)
-            hex_color = f'#{r:02x}{g:02x}{b:02x}'
-            self.coords(self.bars[i], x0, y0, x1, y1)
-            self.itemconfig(self.bars[i], fill=hex_color)
+                    # New starting point is where the bar *used to end*
+                    x0 = self.center_x + (self.ring_radius + self.bar_length_max) * np.cos(angle)
+                    y0 = self.center_y + (self.ring_radius + self.bar_length_max) * np.sin(angle)
+
+                    # New end point goes inward by `bar_len`
+                    x1 = self.center_x + (self.ring_radius + self.bar_length_max - bar_len) * np.cos(angle)
+                    y1 = self.center_y + (self.ring_radius + self.bar_length_max - bar_len) * np.sin(angle)
+
+
+                # Color logic
+                hue = 0.33 * (1 - value)
+                rgb = colorsys.hsv_to_rgb(hue, 1.0, 0.7)
+                base_r, base_g, base_b = [int(255 * c) for c in rgb]
+                blue_strength = 0
+                if self.is_harmonic and self.highlighted_bar_pos is not None:
+                    dist = abs(shifted_index - self.highlighted_bar_pos)
+                    if dist < 1.5:
+                        blue_strength = int(255 * (1 - dist / 1.5))
+                r = min(base_r, 255)
+                g = min(base_g, 255)
+                b = min(base_b + blue_strength, 255)
+                hex_color = f'#{r:02x}{g:02x}{b:02x}'
+                self.coords(self.bars[i], x0, y0, x1, y1)
+                self.itemconfig(self.bars[i], fill=hex_color)
+
 
         # --- Frequency marker update ---
         if self.freq_marker_target_angle is not None:
@@ -362,8 +377,8 @@ async def poll_song_change(callback, poll_interval=2):
                     callback(song)
         await asyncio.sleep(poll_interval)
 
-def main(big=False):
-    global RING_RADIUS, BAR_WIDTH, BAR_MAX_HEIGHT, MIN_BAR_VALUE, MARKER_OFFSET, MARKER_RADIUS
+def main(big=False, layout_type="ringout"):
+    global RING_RADIUS, BAR_WIDTH, BAR_MAX_HEIGHT, MIN_BAR_VALUE, MARKER_OFFSET, MARKER_RADIUS, TYPE
     root = tk.Tk()
     root.title("Live Audio Visualizer 👾")
     root.config(bg='black')
@@ -376,6 +391,8 @@ def main(big=False):
         MIN_BAR_VALUE = 0.03
         MARKER_OFFSET = 20
         MARKER_RADIUS = 10
+    print(f"type: {type}")
+    TYPE = layout_type
     visualizer = AudioVisualizer(root)
 
     song_var = tk.StringVar()
@@ -482,9 +499,14 @@ def main(big=False):
 if __name__ == "__main__":
     # use command line arguments to set the size
     big = False
-    if len(sys.argv) > 1:
+    layout_type = "ringout"
+    args_count = len(sys.argv)
+    if args_count > 1:
         cmd_input = sys.argv[1]
         print(f"Command line argument: {cmd_input}")
         if sys.argv[1] == "big":
             big = True
-    main(big)
+    if args_count > 2:
+        if str(sys.argv[2]):
+            layout_type = sys.argv[2]
+    main(big, layout_type)
