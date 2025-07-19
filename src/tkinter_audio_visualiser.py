@@ -34,6 +34,7 @@ USE_HARMONIC_CHECK = True
 MIN_BAR_VALUE = 0.05  # Minimum bar amplitude (0-1 scale)
 MARKER_OFFSET = 10
 MARKER_RADIUS = 4
+MARKER_COLOR = "#000"
 TYPE = "ringout"  # Default type of visualizer
 
 # Automatically select the desired audio device
@@ -71,6 +72,7 @@ class AudioVisualizer(tk.Canvas):
         self.center_y = self.ring_radius + self.bar_length_max + 30
         width = self.center_x * 2
         height = self.center_y * 2
+        self.highest_peak = 0.0
         super().__init__(
             master,
             width=width,
@@ -234,8 +236,9 @@ class AudioVisualizer(tk.Canvas):
             x = self.center_x + (self.ring_radius + MARKER_OFFSET) * np.cos(angle) # + self.bar_length_max + 15) * np.cos(angle)
             y = self.center_y + (self.ring_radius + MARKER_OFFSET) * np.sin(angle) # + self.bar_length_max + 15) * np.sin(angle)
             r = MARKER_RADIUS
+
             if self.freq_marker_id is None:
-                self.freq_marker_id = self.create_oval(x - r, y - r, x + r, y + r, fill="#000", outline="#222", width=0)
+                self.freq_marker_id = self.create_oval(x - r, y - r, x + r, y + r, fill=MARKER_COLOR, outline="#222", width=1)
             else:
                 self.coords(self.freq_marker_id, x - r, y - r, x + r, y + r)
                 self.itemconfig(self.freq_marker_id, state="normal")
@@ -378,7 +381,7 @@ async def poll_song_change(callback, poll_interval=2):
         await asyncio.sleep(poll_interval)
 
 def main(big=False, layout_type="ringout"):
-    global RING_RADIUS, BAR_WIDTH, BAR_MAX_HEIGHT, MIN_BAR_VALUE, MARKER_OFFSET, MARKER_RADIUS, TYPE
+    global RING_RADIUS, BAR_WIDTH, BAR_MAX_HEIGHT, MIN_BAR_VALUE, MARKER_OFFSET, MARKER_RADIUS, TYPE, MARKER_COLOR
     root = tk.Tk()
     root.title("Live Audio Visualizer 👾")
     root.config(bg='black')
@@ -389,8 +392,9 @@ def main(big=False, layout_type="ringout"):
         BAR_WIDTH = 24
         BAR_MAX_HEIGHT = 400
         MIN_BAR_VALUE = 0.03
-        MARKER_OFFSET = 20
+        MARKER_OFFSET = -40
         MARKER_RADIUS = 10
+        MARKER_COLOR = "#7af"
     print(f"type: {type}")
     TYPE = layout_type
     visualizer = AudioVisualizer(root)
