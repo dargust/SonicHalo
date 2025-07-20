@@ -1,51 +1,53 @@
+# refactored_audio_visualizer.py
 import sys
 import numpy as np
 import sounddevice as sd
-from PyQt5 import QtWidgets, QtGui, QtCore, QtOpenGL
-from OpenGL.GL import *
+from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtWidgets import QOpenGLWidget
+from OpenGL.GL import *
 import ctypes
 
-def make_window_clickthrough(window):
-    hwnd = int(window.winId())  # Native HWND
-    style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
-    style |= 0x80000 | 0x20  # WS_EX_LAYERED | WS_EX_TRANSPARENT
-    ctypes.windll.user32.SetWindowLongW(hwnd, -20, style)
-
-def make_window_clickable(window):
-    hwnd = int(window.winId())  # Native HWND
-    style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
-    style &= ~(0x80000 | 0x20)  # WS_EX_LAYERED | WS_EX_TRANSPARENT
-    ctypes.windll.user32.SetWindowLongW(hwnd, -20, style)
-
+# === Constants === #
 BAR_COUNT = 36
 SAMPLE_RATE = 44100
 CHUNK = 512
 UPDATE_INTERVAL = 16
-BAR_THICKNESS = 0.048
+BAR_THICKNESS = 0.040
 MIN_BAR_HEIGHT = 0.03
+MIN_FREQ = 50
+MAX_FREQ = 12000
+VOCAL_MIN = 155
+VOCAL_MAX = 1100
+HARMONIC_THRESHOLD = 0.15
+MIN_MAX_SEEN = 10.0
 
+# === Utility Functions === #
 def get_weighted_band_edges(min_freq, max_freq, band_count, low_bias=2.5):
-    """
-    Returns band edges with more density in the lows.
-    low_bias > 1.0 means more bands in the lows, 1.0 is pure logspace.
-    """
     t = np.linspace(0, 1, band_count + 1)
-    # bias toward low frequencies
     t_weighted = t ** low_bias
-    band_edges = min_freq * (max_freq / min_freq) ** t_weighted
-    return band_edges
+    return min_freq * (max_freq / min_freq) ** t_weighted
+
+def make_window_clickthrough(window):
+    hwnd = int(window.winId())
+    style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+    style |= 0x80000 | 0x20
+    ctypes.windll.user32.SetWindowLongW(hwnd, -20, style)
+
+def make_window_clickable(window):
+    hwnd = int(window.winId())
+    style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+    style &= ~(0x80000 | 0x20)
+    ctypes.windll.user32.SetWindowLongW(hwnd, -20, style)
 
 class AudioProcessor:
     def __init__(self):
         self.amps = np.zeros(BAR_COUNT)
         self.smoothed_amps = np.zeros(BAR_COUNT)
         self.fall_velocity = np.zeros(BAR_COUNT)
-        self.band_centers = None
+        self.device_index = self.find_device()
+        self.max_seen = 10.0
         self.highlighted_idx = None
         self.highlighted_freq = None
-        self.device_index = self.find_device()
-        self.max_seen = [10.0]
         self.is_harmonic = False
 
     def find_device(self):
@@ -55,93 +57,65 @@ class AudioProcessor:
                 return i
         return None
 
-    def get_weighted_band_edges(self, min_freq, max_freq, band_count, low_bias=2.5):
-        t = np.linspace(0, 1, band_count + 1)
-        t_weighted = t ** low_bias
-        return min_freq * (max_freq / min_freq) ** t_weighted
-
-    def process_audio(self, indata, frames, time_info, status):
+    def analyze_chunk(self, indata, frames, time_info, status):
         mono = np.mean(indata, axis=1)
-        N = 4096*2
+        N = 4096 * 2
         fft = np.abs(np.fft.rfft(mono, n=N))
-        freqs = np.fft.rfftfreq(N, d=1/SAMPLE_RATE)
+        freqs = np.fft.rfftfreq(N, d=1 / SAMPLE_RATE)
 
-        min_freq = 50
-        max_freq = 12000
-        band_edges = get_weighted_band_edges(min_freq, max_freq, BAR_COUNT, low_bias=0.8)
-        amps = np.zeros(BAR_COUNT)
+        band_edges = get_weighted_band_edges(MIN_FREQ, MAX_FREQ, BAR_COUNT, low_bias=0.8)
         band_centers = np.sqrt(band_edges[:-1] * band_edges[1:])
-
         bin_indices = np.digitize(freqs, band_edges) - 1
-        for i in range(BAR_COUNT):
-            bins_in_band = np.where(bin_indices == i)[0]
-            if len(bins_in_band) > 0:
-                amps[i] = np.mean(fft[bins_in_band])
-            else:
-                amps[i] = 0
 
-        gain = np.sqrt(band_centers / band_centers[0])
-        amps *= gain
+        amps = np.array([
+            np.mean(fft[bin_indices == i]) if np.any(bin_indices == i) else 0
+            for i in range(BAR_COUNT)
+        ])
 
-        noise_threshold = 1e-4
-        if np.max(amps) < noise_threshold:
+        amps *= np.sqrt(band_centers / band_centers[0])
+
+        if np.max(amps) < 1e-4:
             amps = np.zeros(BAR_COUNT)
 
         max_fft = np.max(amps)
-        decay_rate = 0.995
-        MIN_MAX_SEEN = 10.0
-
-        if max_fft > self.max_seen[0]:
-            self.max_seen[0] = max_fft
+        if max_fft > self.max_seen:
+            self.max_seen = max_fft
         else:
-            self.max_seen[0] *= decay_rate
-            if self.max_seen[0] < MIN_MAX_SEEN:
-                self.max_seen[0] = MIN_MAX_SEEN
+            self.max_seen = max(self.max_seen * 0.995, MIN_MAX_SEEN)
 
-        vocal_min = 155
-        vocal_max = 1100
-        vocal_band_indices = np.where((band_centers >= vocal_min) & (band_centers <= vocal_max))[0]
-        if self.max_seen[0] < 1e-3 or len(vocal_band_indices) == 0:
-            amps = np.zeros(BAR_COUNT)
+        amps = np.clip(amps / self.max_seen, 0, 1)
+        vocal_indices = np.where((band_centers >= VOCAL_MIN) & (band_centers <= VOCAL_MAX))[0]
+
+        if len(vocal_indices) and np.max(amps[vocal_indices]) > 0.1:
+            self.highlighted_idx = vocal_indices[np.argmax(amps[vocal_indices])]
+        else:
             self.highlighted_idx = None
-        else:
-            amps = np.clip(amps / self.max_seen[0], 0, 1)
-            vocal_amps = amps[vocal_band_indices]
-            if np.max(vocal_amps) > 0.1:
-                self.highlighted_idx = vocal_band_indices[np.argmax(vocal_amps)]
-            else:
-                self.highlighted_idx = None
+
         self.amps = amps
-        
-        # Find the true FFT peak frequency in the vocal range
-        if self.highlighted_idx is not None:
-            # Get the frequency range for the loudest band
-            band_start = band_edges[self.highlighted_idx]
-            band_end = band_edges[self.highlighted_idx + 1]
-            # Find FFT bins within this band
-            bins_in_band = np.where((freqs >= band_start) & (freqs < band_end))[0]
-            if len(bins_in_band) > 0:
-                peak_bin = bins_in_band[np.argmax(fft[bins_in_band])]
-                self.highlighted_freq = freqs[peak_bin]
-            else:
-                self.highlighted_freq = band_centers[self.highlighted_idx]
-        else:
-            self.highlighted_freq = None
-        
-        self.is_harmonic = False
-        if self.highlighted_idx is not None:
-            f0 = band_centers[self.highlighted_idx]
-            harmonics_found = 0
-            for h in range(2, 5):
-                harmonic_freq = f0 * h
-                if harmonic_freq > band_centers[-1]:
-                    break
-                harmonic_idx = np.argmin(np.abs(band_centers - harmonic_freq))
-                if amps[harmonic_idx] > 0.15:
-                    harmonics_found += 1
-            self.is_harmonic = harmonics_found >= 1
-        else:
-            self.is_harmonic = False
+        self.highlighted_freq = self.find_peak_frequency(fft, freqs, band_edges, band_centers)
+        self.is_harmonic = self.detect_harmonics(amps, band_centers)
+
+    def find_peak_frequency(self, fft, freqs, band_edges, band_centers):
+        if self.highlighted_idx is None:
+            return None
+        start, end = band_edges[self.highlighted_idx:self.highlighted_idx + 2]
+        bins = np.where((freqs >= start) & (freqs < end))[0]
+        if bins.size:
+            return freqs[bins[np.argmax(fft[bins])]]
+        return band_centers[self.highlighted_idx]
+
+    def detect_harmonics(self, amps, band_centers):
+        if self.highlighted_idx is None:
+            return False
+        f0 = band_centers[self.highlighted_idx]
+        for h in range(2, 5):
+            harmonic_freq = f0 * h
+            if harmonic_freq > band_centers[-1]:
+                break
+            idx = np.argmin(np.abs(band_centers - harmonic_freq))
+            if amps[idx] > HARMONIC_THRESHOLD:
+                return True
+        return False
 
     def update_smoothed(self):
         for i in range(BAR_COUNT):
@@ -153,27 +127,19 @@ class AudioProcessor:
                 fall_amount = max(0.005, self.fall_velocity[i])
                 self.smoothed_amps[i] = max(0, self.smoothed_amps[i] - fall_amount)
 
-
 class GLVisualizer(QOpenGLWidget):
     def __init__(self, processor, parent=None):
         super().__init__(parent)
         self.processor = processor
-        self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self.update)
-        self.timer.start(UPDATE_INTERVAL)
         self.rotation_offset = 0.0
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
-        self.setAutoFillBackground(False)
         self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self.timer = QtCore.QTimer(timeout=self.update)
+        self.timer.start(UPDATE_INTERVAL)
         self.peak_marker_angle = None
-        self.peak_marker_speed = 0.06
         self.peak_marker_opacity = 0.0
-        self.peak_marker_fade_speed = 0.005
-        self.x_center = None
-        self.y_center = None
 
     def initializeGL(self):
-        glClearColor(0.0, 0.0, 0.0, 1.0)
         glEnable(GL_LINE_SMOOTH)
         glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
 
@@ -186,184 +152,155 @@ class GLVisualizer(QOpenGLWidget):
         glMatrixMode(GL_MODELVIEW)
 
     def paintGL(self):
-        BAR_COUNT_F = float(BAR_COUNT)
-        glClearColor(0.0, 0.0, 0.0, 0.0)
+        self.processor.update_smoothed()
+        glClearColor(0, 0, 0, 0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
 
-
-        self.processor.update_smoothed()
         amps = self.processor.smoothed_amps
+        bass_energy = np.prod(amps[:min(4, BAR_COUNT)])
+        self.rotation_offset += min(bass_energy * 0.2, 0.02) + 0.003
+        self.rotation_offset %= 2 * np.pi
 
-        # Use bass energy to drive rotation speed
-        bass_indices = np.arange(0, min(4, BAR_COUNT))
-        selected_values = amps[bass_indices]
-        self.rotation_speed = min(np.prod(selected_values)*0.2, 0.02) + 0.003
-        #self.rotation_speed = min(np.mean(selected_values)*0.05, 0.02) + 0.003
-        #glRotatef(np.degrees(-self.rotation), 0, 0, 1)
-        self.rotation_offset += self.rotation_speed
-        if self.rotation_offset > 2 * np.pi:
-            self.rotation_offset -= 2 * np.pi
-        # Smooth the wrap by averaging the first and second-to-last bar for the last bar
-        if BAR_COUNT > 2:
-            amps[-1] = (amps[0] + amps[-2]) / 2
         for i in range(BAR_COUNT):
-            shift = (self.rotation_offset * BAR_COUNT_F / (2 * np.pi)) - 3*np.pi
-            shifted_index = (i + shift) % BAR_COUNT_F
+            shifted_index = (i + (self.rotation_offset * BAR_COUNT / (2 * np.pi))) % BAR_COUNT
             idx0 = int(np.floor(shifted_index))
             idx1 = (idx0 + 1) % BAR_COUNT
             frac = shifted_index - idx0
+            value = np.interp(frac, [0, 1], [amps[idx0], amps[idx1]])
+            value = max(value, MIN_BAR_HEIGHT)
+            angle = (2 * np.pi * i) / BAR_COUNT + 1.5 * np.pi + self.rotation_offset
 
-            # Linear interpolation
-            value = (1 - frac) * amps[idx0] + frac * amps[idx1]
-            value = min(max(value, MIN_BAR_HEIGHT), 1)
-            angle = (2 * np.pi * i) / BAR_COUNT + np.pi + self.rotation_offset
-
-            base_radius = 0.3
-            tip_radius = base_radius + value * 0.5
-
-            x0 = np.sin(angle) * base_radius
-            y0 = np.cos(angle) * base_radius
-            x1 = np.sin(angle) * tip_radius
-            y1 = np.cos(angle) * tip_radius
-
-            # Draw polygons instead of lines for the bars, use the base point (x0, y0) and tip point (x1, y1) and create a rectangle extending from the base to the tip there should be two vertices at the base and two at the tip
-
-            # Color gradient based on amplitude
             hue = 0.33 * (1 - value)
             r, g, b = self.hsv_to_rgb(hue, 1, 1)
-            if self.processor.highlighted_idx is not None:
-                dist = abs(shifted_index - self.processor.highlighted_idx)
-                b = max(0.0, 1.0 - dist * 0.4)
-                #b = min(1.0, b + 0.5)
+            self.draw_bar(angle, value, (r/5, g/5, b/5))
 
-            x_bottom_left = x0 - BAR_THICKNESS / 2 * np.cos(-angle)
-            y_bottom_left = y0 - BAR_THICKNESS / 2 * np.sin(-angle)
-            x_bottom_right = x0 + BAR_THICKNESS / 2 * np.cos(-angle)
-            y_bottom_right = y0 + BAR_THICKNESS / 2 * np.sin(-angle)
-            x_top_left = x1 - BAR_THICKNESS / 2 * np.cos(-angle)
-            y_top_left = y1 - BAR_THICKNESS / 2 * np.sin(-angle)
-            x_top_right = x1 + BAR_THICKNESS / 2 * np.cos(-angle)
-            y_top_right = y1 + BAR_THICKNESS / 2 * np.sin(-angle)
+        self.draw_peak_circle()
 
-            glBegin(GL_POLYGON)
+    def draw_bar(self, angle, value, color):
+        base = 0.3 - value * 0.05
+        tip = base + value * 0.5
+        x0, y0 = np.sin(angle) * base, np.cos(angle) * base
+        x1, y1 = np.sin(angle) * tip, np.cos(angle) * tip
+        dx, dy = BAR_THICKNESS / 2 * np.cos(-angle), BAR_THICKNESS / 2 * np.sin(-angle)
 
-            glColor4f(r/5, g/5, b/5, 0.2)
+        vertices = [
+            (x0 - dx, y0 - dy), (x0 + dx, y0 + dy),
+            (x1 + dx, y1 + dy), (x1 - dx, y1 - dy)
+        ]
 
-            glVertex2f(x_bottom_left, y_bottom_left)
-            glVertex2f(x_bottom_right, y_bottom_right)
-            glVertex2f(x_top_right, y_top_right)
-            glVertex2f(x_top_left, y_top_left)
+        glBegin(GL_POLYGON)
+        glColor4f(*color, 0.2)
+        for x, y in vertices:
+            glVertex2f(x, y)
+        glEnd()
 
-            glEnd()
+    def draw_peak_circle(self):
+        if self.processor.highlighted_freq and self.processor.is_harmonic:
+            centers = np.sqrt(
+                get_weighted_band_edges(MIN_FREQ, MAX_FREQ, BAR_COUNT, 0.8)[:-1] *
+                get_weighted_band_edges(MIN_FREQ, MAX_FREQ, BAR_COUNT, 0.8)[1:]
+            )
+            idx = np.argmin(np.abs(centers - self.processor.highlighted_freq))
+            target_angle = (2 * np.pi * idx) / BAR_COUNT + 1.5 * np.pi
 
-        offset_from_center = 0.25
-        radius = 0.02 # + (self.processor.amps[highlighted_idx] * 0.1)
-
-        # Draw a circle at the peak frequency if it exists
-        if self.processor.highlighted_freq is not None and self.processor.is_harmonic:
-            freq = self.processor.highlighted_freq
-            band_edges = get_weighted_band_edges(50, 12000, BAR_COUNT, low_bias=0.8)
-            band_centers = np.sqrt(band_edges[:-1] * band_edges[1:])
-            highlighted_idx = np.argmin(np.abs(band_centers - freq))
-            peak_marker_angle_target = (2 * np.pi * highlighted_idx) / BAR_COUNT + 1.5 * np.pi # + self.rotation_offset
-            if self.peak_marker_angle == None:
-                self.peak_marker_angle = peak_marker_angle_target
-            self.peak_marker_angle += (peak_marker_angle_target - self.peak_marker_angle) * self.peak_marker_speed
-
-            self.x_center = np.sin(self.peak_marker_angle) * offset_from_center
-            self.y_center = np.cos(self.peak_marker_angle) * offset_from_center
-            if self.peak_marker_opacity < 0.2:
-                self.peak_marker_opacity = 0.2
+            if self.peak_marker_angle is None:
+                self.peak_marker_angle = target_angle
+            self.peak_marker_angle += (target_angle - self.peak_marker_angle) * 0.06
+            self.peak_marker_opacity = 0.2
+            self.last_valid_marker = (self.peak_marker_angle, QtCore.QTime.currentTime())
         else:
-            if self.peak_marker_opacity > 0.0:
-                self.peak_marker_opacity -= self.peak_marker_fade_speed
-        
-        if self.x_center:
-            glBegin(GL_POLYGON)
-            # Set line thickness
-            glColor4f(0.3*self.peak_marker_opacity, 0.6*self.peak_marker_opacity, 1*self.peak_marker_opacity, self.peak_marker_opacity)
+            if hasattr(self, 'last_valid_marker'):
+                elapsed = self.last_valid_marker[1].msecsTo(QtCore.QTime.currentTime()) / 1000.0
+                fade_duration = 1.5  # seconds
+                if elapsed < fade_duration:
+                    self.peak_marker_angle = self.last_valid_marker[0]
+                    self.peak_marker_opacity = 0.2 * (1 - (elapsed / fade_duration))
+                else:
+                    self.peak_marker_opacity = 0.0
+                    return
+            else:
+                self.peak_marker_opacity = max(0.0, self.peak_marker_opacity - 0.005)
+                return
 
-            for j in range(100):
-                theta = 2 * np.pi * j / 100
-                x = self.x_center + radius * np.cos(theta)
-                y = self.y_center + radius * np.sin(theta)
-                glVertex2f(x, y)
+        x = np.sin(self.peak_marker_angle) * 0.22
+        y = np.cos(self.peak_marker_angle) * 0.22
 
-            glEnd()
-            
-            #glLineWidth(BAR_THICKNESS)
-            #glBegin(GL_LINES)
-            #glVertex2f(x0, y0)
-            #glVertex2f(x1, y1)
+        glBegin(GL_POLYGON)
+        glColor4f(0.3 * self.peak_marker_opacity, 0.6 * self.peak_marker_opacity, 1 * self.peak_marker_opacity, self.peak_marker_opacity)
+        for j in range(24):
+            theta = 2 * np.pi * j / 24
+            glVertex2f(x + 0.02 * np.cos(theta), y + 0.02 * np.sin(theta))
+        glEnd()
 
-    def hsv_to_rgb(self, h, s, v):
+
+    @staticmethod
+    def hsv_to_rgb(h, s, v):
         i = int(h * 6)
         f = h * 6 - i
-        p = v * (1 - s)
-        q = v * (1 - f * s)
-        t = v * (1 - (1 - f) * s)
-        i = i % 6
-        if i == 0:
-            return v, t, p
-        if i == 1:
-            return q, v, p
-        if i == 2:
-            return p, v, t
-        if i == 3:
-            return p, q, v
-        if i == 4:
-            return t, p, v
-        if i == 5:
-            return v, p, q
-
+        p, q, t = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
+        i %= 6
+        return [(v, t, p), (q, v, p), (p, v, t), (p, q, v), (t, p, v), (v, p, q)][i]
 
 class MainWindow(QtWidgets.QMainWindow):
-
     def __init__(self):
         super().__init__()
         self.processor = AudioProcessor()
         self.visualizer = GLVisualizer(self.processor)
         self.setCentralWidget(self.visualizer)
-        self.setWindowTitle("Raw OpenGL Audio Visualizer")
+        self.setWindowTitle("OpenGL Audio Visualizer")
         self.resize(800, 800)
-        # Make the window always on top
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
 
         sd.InputStream(device=self.processor.device_index,
                        channels=2,
                        samplerate=SAMPLE_RATE,
                        blocksize=CHUNK,
-                       callback=self.processor.process_audio
-                       ).start()
-    
-    def display_mode(self):
-        # Make the window frameless
-        self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
-        # Make the window transparent using the alpha channel
-        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
-        # Let the cursor pass through the window
-        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
-        self.show()
-        make_window_clickthrough(self)
-
-    def window_mode(self):
-        # Reset the window flags to default
-        self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.WindowStaysOnTopHint)
-        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, False)
-        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
-        self.show()
-        make_window_clickable(self)
+                       callback=self.processor.analyze_chunk).start()
 
     def keyPressEvent(self, event):
-        key = event.key()
-        if key == QtCore.Qt.Key_P:
+        if event.key() == QtCore.Qt.Key_P:
             if self.windowFlags() & QtCore.Qt.FramelessWindowHint:
                 self.window_mode()
             else:
                 self.display_mode()
-        elif key == QtCore.Qt.Key_Escape:
+        elif event.key() == QtCore.Qt.Key_Escape:
             self.close()
+
+    def display_mode(self):
+        '''self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self.show()
+        make_window_clickthrough(self)'''
+        pos = self.pos()  # Save position
+        self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self.show()
+        # offset pos to correct the movement
+        pos.setX(pos.x() - 0)
+        pos.setY(pos.y() - 1)
+        self.move(pos)  # Restore position
+        make_window_clickthrough(self)
+
+    def window_mode(self):
+        '''
+        self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.WindowStaysOnTopHint)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, False)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
+        self.show()
+        make_window_clickable(self)'''
+        pos = self.pos()
+        self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.WindowStaysOnTopHint)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, False)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
+        self.show()
+        # offset pos to correct the movement
+        pos.setX(pos.x() - 8)
+        pos.setY(pos.y() - 30)
+        self.move(pos)
+        make_window_clickable(self)
 
 if __name__ == '__main__':
     fmt = QtGui.QSurfaceFormat()
