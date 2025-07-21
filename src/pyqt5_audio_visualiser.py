@@ -16,10 +16,12 @@ BAR_THICKNESS = 0.040
 MIN_BAR_HEIGHT = 0.03
 MIN_FREQ = 50
 MAX_FREQ = 12000
-VOCAL_MIN = 155
-VOCAL_MAX = 1100
-HARMONIC_THRESHOLD = 0.15
+VOCAL_MIN = 180
+VOCAL_MAX = 1200
+HARMONIC_THRESHOLD = 0.1
 MIN_MAX_SEEN = 10.0
+ROUNDED_CAPS = True
+MAX_OPACITY = 0.2
 
 # === Utility Functions === #
 def get_weighted_band_edges(min_freq, max_freq, band_count, low_bias=2.5):
@@ -93,7 +95,7 @@ class AudioProcessor:
 
         self.amps = amps
         self.highlighted_freq = self.find_peak_frequency(fft, freqs, band_edges, band_centers)
-        self.is_harmonic = self.detect_harmonics(amps, band_centers)
+        self.detect_harmonics(amps, band_centers)
 
     def find_peak_frequency(self, fft, freqs, band_edges, band_centers):
         if self.highlighted_idx is None:
@@ -105,17 +107,40 @@ class AudioProcessor:
         return band_centers[self.highlighted_idx]
 
     def detect_harmonics(self, amps, band_centers):
-        if self.highlighted_idx is None:
-            return False
-        f0 = band_centers[self.highlighted_idx]
-        for h in range(2, 5):
-            harmonic_freq = f0 * h
-            if harmonic_freq > band_centers[-1]:
-                break
-            idx = np.argmin(np.abs(band_centers - harmonic_freq))
-            if amps[idx] > HARMONIC_THRESHOLD:
-                return True
-        return False
+        vocal_range = (band_centers >= VOCAL_MIN) & (band_centers <= VOCAL_MAX)
+        candidates = np.where((amps > 0.1) & vocal_range)[0]
+
+        best_score = 0
+        best_f0 = None
+
+        for idx in candidates:
+            f0 = band_centers[idx]
+            harmonics_found = 0
+            total_strength = 0
+
+            for h in range(2, 4):  # check 2nd–4th harmonics
+                harmonic_freq = f0 / h
+                if harmonic_freq < VOCAL_MIN / 5:
+                    continue
+                harmonic_idx = np.argmin(np.abs(band_centers - harmonic_freq))
+                if amps[harmonic_idx] > 0.1:
+                    if amps[harmonic_idx] > amps[idx]: # discard if harmonic is more than candidate
+                        continue
+                    harmonics_found += 1
+                    total_strength += amps[harmonic_idx]
+
+            score = harmonics_found + total_strength # blend quantity + intensity
+            if harmonics_found >= 2 and score > best_score and score > 2.0:
+                best_score = score
+                best_f0 = f0
+
+        # Set result
+        if best_f0:
+            self.highlighted_freq = best_f0
+            self.is_harmonic = True
+        else:
+            self.highlighted_freq = None
+            self.is_harmonic = False
 
     def update_smoothed(self):
         for i in range(BAR_COUNT):
@@ -136,8 +161,10 @@ class GLVisualizer(QOpenGLWidget):
         self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
         self.timer = QtCore.QTimer(timeout=self.update)
         self.timer.start(UPDATE_INTERVAL)
+        self.bar_opacity = MAX_OPACITY
         self.peak_marker_angle = None
         self.peak_marker_opacity = 0.0
+        self.peak_hue = 0.0
 
     def initializeGL(self):
         glEnable(GL_LINE_SMOOTH)
@@ -162,6 +189,9 @@ class GLVisualizer(QOpenGLWidget):
         self.rotation_offset += min(bass_energy * 0.2, 0.02) + 0.003
         self.rotation_offset %= 2 * np.pi
 
+        min_value = 0.0
+        max_value = 0.0
+        peak_hue = 0.0
         for i in range(BAR_COUNT):
             shifted_index = (i + (self.rotation_offset * BAR_COUNT / (2 * np.pi))) % BAR_COUNT
             idx0 = int(np.floor(shifted_index))
@@ -169,12 +199,29 @@ class GLVisualizer(QOpenGLWidget):
             frac = shifted_index - idx0
             value = np.interp(frac, [0, 1], [amps[idx0], amps[idx1]])
             value = max(value, MIN_BAR_HEIGHT)
+            min_value = max(value, min_value)
             angle = (2 * np.pi * i) / BAR_COUNT + 1.5 * np.pi + self.rotation_offset
 
             hue = 0.33 * (1 - value)
+            if value > max_value:
+                max_value = value
+                peak_hue = hue
             r, g, b = self.hsv_to_rgb(hue, 1, 1)
-            self.draw_bar(angle, value, (r/5, g/5, b/5))
-
+            self.draw_bar(angle, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity))
+        self.peak_hue = peak_hue
+        if min_value > MIN_BAR_HEIGHT:
+            self.bar_opacity = MAX_OPACITY
+            self.last_valid_bar = QtCore.QTime.currentTime()
+        else:
+            if hasattr(self, 'last_valid_bar'):
+                elapsed = self.last_valid_bar.msecsTo(QtCore.QTime.currentTime()) / 1000.0
+                fade_duration = 15
+                if elapsed < fade_duration:
+                    self.bar_opacity = MAX_OPACITY * (1 - (elapsed / fade_duration))
+                else:
+                    self.bar_opacity = 0.0
+            else:
+                self.bar_opacity = max(0.0, self.bar_opacity - 0.005)
         self.draw_peak_circle()
 
     def draw_bar(self, angle, value, color):
@@ -182,26 +229,79 @@ class GLVisualizer(QOpenGLWidget):
         tip = base + value * 0.5
         x0, y0 = np.sin(angle) * base, np.cos(angle) * base
         x1, y1 = np.sin(angle) * tip, np.cos(angle) * tip
-        dx, dy = BAR_THICKNESS / 2 * np.cos(-angle), BAR_THICKNESS / 2 * np.sin(-angle)
+        
+        if ROUNDED_CAPS:
+            self.draw_rounded_bar(x0, y0, x1, y1, angle, color)
+        else:
+            dx, dy = BAR_THICKNESS / 2 * np.cos(-angle), BAR_THICKNESS / 2 * np.sin(-angle)
 
-        vertices = [
-            (x0 - dx, y0 - dy), (x0 + dx, y0 + dy),
-            (x1 + dx, y1 + dy), (x1 - dx, y1 - dy)
+            vertices = [
+                (x0 - dx, y0 - dy), (x0 + dx, y0 + dy),
+                (x1 + dx, y1 + dy), (x1 - dx, y1 - dy)
+            ]
+
+            glBegin(GL_POLYGON)
+            glColor4f(*color)
+            for x, y in vertices:
+                glVertex2f(x, y)
+            glEnd()
+    
+    def draw_rounded_bar(self, x0, y0, x1, y1, angle, color, radius=BAR_THICKNESS/2):
+        # 1. Draw the rectangle body
+        dx = radius * np.cos(-angle)
+        dy = radius * np.sin(-angle)
+
+        corners = [
+            (x0 - dx, y0 - dy),
+            (x0 + dx, y0 + dy),
+            (x1 + dx, y1 + dy),
+            (x1 - dx, y1 - dy),
         ]
 
         glBegin(GL_POLYGON)
-        glColor4f(*color, 0.2)
-        for x, y in vertices:
+        glColor4f(*color)
+        for x, y in corners:
+            glVertex2f(x, y)
+        glEnd()
+        angle = -angle
+        # 2. Draw rounded top (tip)
+        glBegin(GL_TRIANGLE_FAN)
+        glVertex2f(x1, y1)  # center of the semicircle
+
+        for i in range(8):
+            theta = np.pi * i / 7  # 0 to pi
+            x = x1 + radius * np.cos(theta + angle)
+            y = y1 + radius * np.sin(theta + angle)
             glVertex2f(x, y)
         glEnd()
 
-    def draw_peak_circle(self):
-        if self.processor.highlighted_freq and self.processor.is_harmonic:
+        # 3. Optional: rounded base
+        glBegin(GL_TRIANGLE_FAN)
+        glVertex2f(x0, y0)  # center
+
+        for i in range(6):
+            theta = np.pi * i / 5 + np.pi  # pi to 2pi
+            x = x0 + radius * np.cos(theta + angle)
+            y = y0 + radius * np.sin(theta + angle)
+            glVertex2f(x, y)
+        glEnd()
+
+
+    def draw_peak_circle(self, optional_marker_freq=None):
+        held_freq = self.processor.highlighted_freq
+        if held_freq and self.processor.is_harmonic:
             centers = np.sqrt(
                 get_weighted_band_edges(MIN_FREQ, MAX_FREQ, BAR_COUNT, 0.8)[:-1] *
                 get_weighted_band_edges(MIN_FREQ, MAX_FREQ, BAR_COUNT, 0.8)[1:]
             )
-            idx = np.argmin(np.abs(centers - self.processor.highlighted_freq))
+            try:
+                if optional_marker_freq:
+                    idx = np.argmin(np.abs(centers - optional_marker_freq))
+                else:
+                    idx = np.argmin(np.abs(centers - held_freq))
+            except TypeError as e:
+                print(f"potential race condition, highlighted_freq is {held_freq}")
+                return
             target_angle = (2 * np.pi * idx) / BAR_COUNT + 1.5 * np.pi
 
             if self.peak_marker_angle is None:
@@ -212,7 +312,7 @@ class GLVisualizer(QOpenGLWidget):
         else:
             if hasattr(self, 'last_valid_marker'):
                 elapsed = self.last_valid_marker[1].msecsTo(QtCore.QTime.currentTime()) / 1000.0
-                fade_duration = 1.5  # seconds
+                fade_duration = 1.0  # seconds
                 if elapsed < fade_duration:
                     self.peak_marker_angle = self.last_valid_marker[0]
                     self.peak_marker_opacity = 0.2 * (1 - (elapsed / fade_duration))
@@ -223,14 +323,24 @@ class GLVisualizer(QOpenGLWidget):
                 self.peak_marker_opacity = max(0.0, self.peak_marker_opacity - 0.005)
                 return
 
-        x = np.sin(self.peak_marker_angle) * 0.22
-        y = np.cos(self.peak_marker_angle) * 0.22
+        x = np.sin(self.peak_marker_angle) * 0.20
+        y = np.cos(self.peak_marker_angle) * 0.20
+        marker_radius = BAR_THICKNESS / 2
 
         glBegin(GL_POLYGON)
-        glColor4f(0.3 * self.peak_marker_opacity, 0.6 * self.peak_marker_opacity, 1 * self.peak_marker_opacity, self.peak_marker_opacity)
-        for j in range(24):
-            theta = 2 * np.pi * j / 24
-            glVertex2f(x + 0.02 * np.cos(theta), y + 0.02 * np.sin(theta))
+        glColor4f(0.0, 0.0, 0.0, 1.0)#self.peak_marker_opacity)
+        for j in range(12):
+            theta = 2 * np.pi * j / 12
+            glVertex2f(x + marker_radius * 1.25 * np.cos(theta), y + marker_radius * 1.25 * np.sin(theta))
+        glEnd()
+
+        glBegin(GL_POLYGON)
+        r,g,b = self.hsv_to_rgb(self.peak_hue, 1, 1)
+        glColor4f(r*self.peak_marker_opacity, g*self.peak_marker_opacity, b*self.peak_marker_opacity, self.peak_marker_opacity)
+        #glColor4f(0.3 * self.peak_marker_opacity, 0.6 * self.peak_marker_opacity, 1 * self.peak_marker_opacity, self.peak_marker_opacity)
+        for j in range(12):
+            theta = 2 * np.pi * j / 12
+            glVertex2f(x + marker_radius * np.cos(theta), y + marker_radius * np.sin(theta))
         glEnd()
 
 
