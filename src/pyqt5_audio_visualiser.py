@@ -10,9 +10,9 @@ import ctypes
 # === Constants === #
 BAR_COUNT = 36
 SAMPLE_RATE = 44100
-CHUNK = 512
+CHUNK = 1024
 UPDATE_INTERVAL = 16
-BAR_THICKNESS = 0.040
+BAR_THICKNESS = 0.036
 MIN_BAR_HEIGHT = 0.03
 MIN_FREQ = 50
 MAX_FREQ = 12000
@@ -22,6 +22,7 @@ HARMONIC_THRESHOLD = 0.1
 MIN_MAX_SEEN = 10.0
 ROUNDED_CAPS = True
 MAX_OPACITY = 0.2
+OUTLINE_SCALE = 1.5
 
 # === Utility Functions === #
 def get_weighted_band_edges(min_freq, max_freq, band_count, low_bias=2.5):
@@ -165,6 +166,7 @@ class GLVisualizer(QOpenGLWidget):
         self.peak_marker_angle = None
         self.peak_marker_opacity = 0.0
         self.peak_hue = 0.0
+        self.elapsed_time = QtCore.QTime.currentTime()
 
     def initializeGL(self):
         glEnable(GL_LINE_SMOOTH)
@@ -179,6 +181,10 @@ class GLVisualizer(QOpenGLWidget):
         glMatrixMode(GL_MODELVIEW)
 
     def paintGL(self):
+        #new_time = QtCore.QTime.currentTime()
+        #delta = self.elapsed_time.msecsTo(new_time)
+        #self.elapsed_time = new_time
+        #print(delta)
         self.processor.update_smoothed()
         glClearColor(0, 0, 0, 0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -246,45 +252,53 @@ class GLVisualizer(QOpenGLWidget):
                 glVertex2f(x, y)
             glEnd()
     
-    def draw_rounded_bar(self, x0, y0, x1, y1, angle, color, radius=BAR_THICKNESS/2):
-        # 1. Draw the rectangle body
-        dx = radius * np.cos(-angle)
-        dy = radius * np.sin(-angle)
+    def draw_rounded_bar(self, x0, y0, x1, y1, angle, color, radius=BAR_THICKNESS / 2):
+        def draw_segment(x0, y0, x1, y1, angle, color, radius):
+            dx = radius * np.cos(-angle)
+            dy = radius * np.sin(-angle)
 
-        corners = [
-            (x0 - dx, y0 - dy),
-            (x0 + dx, y0 + dy),
-            (x1 + dx, y1 + dy),
-            (x1 - dx, y1 - dy),
-        ]
+            # Rectangle body
+            corners = [
+                (x0 - dx, y0 - dy),
+                (x0 + dx, y0 + dy),
+                (x1 + dx, y1 + dy),
+                (x1 - dx, y1 - dy),
+            ]
 
-        glBegin(GL_POLYGON)
-        glColor4f(*color)
-        for x, y in corners:
-            glVertex2f(x, y)
-        glEnd()
-        angle = -angle
-        # 2. Draw rounded top (tip)
-        glBegin(GL_TRIANGLE_FAN)
-        glVertex2f(x1, y1)  # center of the semicircle
+            glBegin(GL_POLYGON)
+            glColor4f(*color)
+            for x, y in corners:
+                glVertex2f(x, y)
+            glEnd()
 
-        for i in range(8):
-            theta = np.pi * i / 7  # 0 to pi
-            x = x1 + radius * np.cos(theta + angle)
-            y = y1 + radius * np.sin(theta + angle)
-            glVertex2f(x, y)
-        glEnd()
+            # Rounded tip
+            glBegin(GL_TRIANGLE_FAN)
+            glVertex2f(x1, y1)
+            for i in range(8):
+                theta = np.pi * i / 7
+                x = x1 + radius * np.cos(theta - angle)
+                y = y1 + radius * np.sin(theta - angle)
+                glVertex2f(x, y)
+            glEnd()
 
-        # 3. Optional: rounded base
-        glBegin(GL_TRIANGLE_FAN)
-        glVertex2f(x0, y0)  # center
+            # Rounded base
+            glBegin(GL_TRIANGLE_FAN)
+            glVertex2f(x0, y0)
+            for i in range(8):
+                theta = np.pi * i / 7 + np.pi
+                x = x0 + radius * np.cos(theta - angle)
+                y = y0 + radius * np.sin(theta - angle)
+                glVertex2f(x, y)
+            glEnd()
 
-        for i in range(6):
-            theta = np.pi * i / 5 + np.pi  # pi to 2pi
-            x = x0 + radius * np.cos(theta + angle)
-            y = y0 + radius * np.sin(theta + angle)
-            glVertex2f(x, y)
-        glEnd()
+        if OUTLINE_SCALE > 1:
+            # 1. Draw black outline slightly larger
+            outline_color = (0.0, 0.0, 0.0, self.bar_opacity)
+            draw_segment(x0, y0, x1, y1, angle, outline_color, radius * OUTLINE_SCALE)
+
+        # 2. Draw actual bar
+        draw_segment(x0, y0, x1, y1, angle, color, radius)
+
 
 
     def draw_peak_circle(self, optional_marker_freq=None):
@@ -327,19 +341,20 @@ class GLVisualizer(QOpenGLWidget):
         y = np.cos(self.peak_marker_angle) * 0.20
         marker_radius = BAR_THICKNESS / 2
 
-        glBegin(GL_POLYGON)
-        glColor4f(0.0, 0.0, 0.0, 1.0)#self.peak_marker_opacity)
-        for j in range(12):
-            theta = 2 * np.pi * j / 12
-            glVertex2f(x + marker_radius * 1.25 * np.cos(theta), y + marker_radius * 1.25 * np.sin(theta))
-        glEnd()
+        if OUTLINE_SCALE > 1:
+            glBegin(GL_POLYGON)
+            glColor4f(0.0, 0.0, 0.0, self.peak_marker_opacity)#self.peak_marker_opacity)
+            for j in range(8):
+                theta = 2 * np.pi * j / 8
+                glVertex2f(x + marker_radius * OUTLINE_SCALE * np.cos(theta), y + marker_radius * OUTLINE_SCALE * np.sin(theta))
+            glEnd()
 
         glBegin(GL_POLYGON)
         r,g,b = self.hsv_to_rgb(self.peak_hue, 1, 1)
         glColor4f(r*self.peak_marker_opacity, g*self.peak_marker_opacity, b*self.peak_marker_opacity, self.peak_marker_opacity)
         #glColor4f(0.3 * self.peak_marker_opacity, 0.6 * self.peak_marker_opacity, 1 * self.peak_marker_opacity, self.peak_marker_opacity)
-        for j in range(12):
-            theta = 2 * np.pi * j / 12
+        for j in range(8):
+            theta = 2 * np.pi * j / 8
             glVertex2f(x + marker_radius * np.cos(theta), y + marker_radius * np.sin(theta))
         glEnd()
 
