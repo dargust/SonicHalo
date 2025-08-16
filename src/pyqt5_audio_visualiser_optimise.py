@@ -671,6 +671,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 settings["MAX_OPACITY"] = round(settings["MAX_OPACITY"] + 0.1, 1)
                 rounded_opacity = round(settings["MAX_OPACITY"], 1)
                 logging.info(f"Updated MAX_OPACITY: {rounded_opacity}")
+        elif event.key() == QtCore.Qt.Key_I:
+            if settings["OUTLINE_SCALE"] < 10.0:
+                settings["OUTLINE_SCALE"] = round(settings["OUTLINE_SCALE"] + 0.1, 2)
+                printed_outline_scale = settings["OUTLINE_SCALE"]
+                logging.info(f"Updated OUTLINE_SCALE: {printed_outline_scale}")
+        elif event.key() == QtCore.Qt.Key_K:
+            if settings["OUTLINE_SCALE"] > 0.0:
+                settings["OUTLINE_SCALE"] = round(settings["OUTLINE_SCALE"] - 0.1, 2)
+                printed_outline_scale = settings["OUTLINE_SCALE"]
+                logging.info(f"Updated OUTLINE_SCALE: {printed_outline_scale}")
         elif event.key() == QtCore.Qt.Key_R:
             settings = default_settings.copy()
         elif event.key() == QtCore.Qt.Key_Escape:
