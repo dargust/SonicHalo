@@ -1,0 +1,1 @@
+magick convert media/sonic_halo_frame.png -resize 64x64 media/sonic_halo_2.ico

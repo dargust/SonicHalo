@@ -1,0 +1,771 @@
+# refactored_audio_visualizer.py
+import sys
+import numpy as np
+import sounddevice as sd
+from PyQt5 import QtWidgets, QtGui, QtCore
+from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import QOpenGLWidget
+from OpenGL.GL import *
+import ctypes
+from ctypes import wintypes
+import os, sys, faulthandler, traceback, logging
+import time
+
+print(f"System platform: {sys.platform}")
+ON_WINDOWS = sys.platform.startswith('win')
+ON_LINUX = sys.platform.startswith('linux')
+
+if ON_WINDOWS:
+    try:
+        from winsdk.windows.media.control import \
+            GlobalSystemMediaTransportControlsSessionManager as MediaManager
+    except ImportError:
+        MediaManager = None
+else:
+    MediaManager = None
+
+log_path = os.path.join(os.path.dirname(__file__), 'app_debug.log')
+logging.basicConfig(filename=log_path,
+                    level=logging.DEBUG,
+                    format="{levelname} - {message}",
+                    style="{")
+sys.stderr = open(log_path, 'a', buffering=1)
+faulthandler.enable(file=sys.stderr, all_threads=True)
+def _exchook(exc_type, exc, tb):
+    logging.error("Unhandled exception", exc_info=(exc_type, exc, tb))
+sys.excepthook = _exchook
+logging.info("App started (logging -> %s)", log_path)
+
+
+DEBUG = True
+
+# === Constants === #
+WINDOW_WIDTH = 400
+WINDOW_HEIGHT = WINDOW_WIDTH
+BAR_COUNT = 28 #36
+SAMPLE_RATE = 48000
+CHUNK = 2048
+UPDATE_INTERVAL = 16
+BAR_THICKNESS = 0.04 # 0.036
+MIN_BAR_HEIGHT = 0.03
+MIN_FREQ = 50
+MAX_FREQ = 12000
+VOCAL_MIN = 200
+VOCAL_MAX = 2200
+HARMONIC_THRESHOLD = 0.1
+MIN_MAX_SEEN = 10.0
+ROUNDED_CAPS = False
+MAX_OPACITY = 0.4
+OUTLINE_SCALE = 0 # 1.25
+ARC_POINT_COUNT = 6
+MARKER_OFFSET = 0.3 # 0.2
+LOW_COLOUR = (0.00, 0.15, 0.31)
+MID_COLOUR = (0.08, 0.41, 0.63)
+HIGH_COLOUR = (0.99, 0.81, 0.63)
+
+settings = {"BAR_COUNT": BAR_COUNT,
+            "SAMPLE_RATE": SAMPLE_RATE,
+            "CHUNK": CHUNK,
+            "UPDATE_INTERVAL": UPDATE_INTERVAL,
+            "BAR_THICKNESS": BAR_THICKNESS,
+            "MIN_BAR_HEIGHT": MIN_BAR_HEIGHT,
+            "MIN_FREQ": MIN_FREQ,
+            "MAX_FREQ": MAX_FREQ,
+            "VOCAL_MIN": VOCAL_MIN,
+            "VOCAL_MAX": VOCAL_MAX,
+            "HARMONIC_THRESHOLD": HARMONIC_THRESHOLD,
+            "MIN_MAX_SEEN": MIN_MAX_SEEN,
+            "ROUNDED_CAPS": ROUNDED_CAPS,
+            "MAX_OPACITY": MAX_OPACITY,
+            "OUTLINE_SCALE": OUTLINE_SCALE,
+            "ARC_POINT_COUNT": ARC_POINT_COUNT,
+            "MARKER_OFFSET": MARKER_OFFSET}
+
+logging.info("settings:")
+for k,v in settings.items():
+    logging.info(f"    {k} = {v}")
+
+# === Utility Functions === #
+def get_weighted_band_edges(min_freq, max_freq, band_count, low_bias=2.5):
+    t = np.linspace(0, 1, band_count + 1)
+    t_weighted = t ** low_bias
+    return min_freq * (max_freq / min_freq) ** t_weighted
+
+_user32 = ctypes.WinDLL('user32', use_last_error=True)
+
+# pick proper functions (Get/SetWindowLongPtr if available)
+GetWindowLongPtr = getattr(_user32, 'GetWindowLongPtrW', _user32.GetWindowLongW)
+SetWindowLongPtr = getattr(_user32, 'SetWindowLongPtrW', _user32.SetWindowLongW)
+GetWindowLongPtr.restype = wintypes.LONG if ctypes.sizeof(ctypes.c_void_p) == 4 else ctypes.c_longlong
+GetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int]
+SetWindowLongPtr.restype = wintypes.LONG if ctypes.sizeof(ctypes.c_void_p) == 4 else ctypes.c_longlong
+SetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p)==8 else ctypes.c_long]
+
+SetWindowPos = _user32.SetWindowPos
+SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x80000
+WS_EX_TRANSPARENT = 0x20
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_FRAMECHANGED = 0x0020
+
+def _apply_clickthrough(window, enable: bool):
+    """Do the Win32 style change. MUST be called on GUI thread; it is not thread-safe."""
+    try:
+        hwnd = wintypes.HWND(int(window.winId()))
+        cur = GetWindowLongPtr(hwnd, GWL_EXSTYLE)
+        if enable:
+            cur |= (WS_EX_LAYERED | WS_EX_TRANSPARENT)
+        else:
+            cur &= ~(WS_EX_LAYERED | WS_EX_TRANSPARENT)
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, cur)
+        # apply the change
+        SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED)
+        logging.debug("Applied clickthrough=%s to hwnd=%s", enable, hwnd)
+    except Exception:
+        logging.exception("Failed to apply clickthrough")
+
+def make_window_clickthrough(window):
+    try:
+        hwnd = int(window.winId())
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+        style |= 0x80000 | 0x20
+        ctypes.windll.user32.SetWindowLongW(hwnd, -20, style)
+    except Exception as e:
+        logging.error(f"Failed to make window clickthrough: {e}")
+
+
+def make_window_clickable(window):
+    try:
+        hwnd = int(window.winId())
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+        style &= ~(0x80000 | 0x20)
+        ctypes.windll.user32.SetWindowLongW(hwnd, -20, style)
+    except Exception as e:
+        logging.error(f"Failed to make window clickable: {e}")
+
+
+def pid_controller(setpoint, pv, kp, ki, kd, previous_error, integral, dt):
+    try:
+        error = setpoint - pv
+        integral += error * dt
+        derivative = (error - previous_error) / dt
+        control = kp * error + ki * integral + kd *derivative
+        return control, error, integral
+    except ValueError:
+        return 0.0, 0.0, 0.0
+    
+
+
+class AudioProcessor:
+    def __init__(self):
+        logging.info("Initialising AudioProcessor")
+        self.amps = np.zeros(BAR_COUNT)
+        self.smoothed_amps = np.zeros(BAR_COUNT)
+        self.fall_velocity = np.zeros(BAR_COUNT)
+        self.device_index = self.find_device()
+        self.max_seen = 10.0
+        self.highlighted_idx = None
+        self.highlighted_freq = []
+        self.is_harmonic = False
+        self.control = 0
+        self.error = 0
+        self.integral = 0
+        self.delta = 16
+
+    def find_device(self):
+        devices = sd.query_devices()
+        for i, dev in enumerate(devices):
+            if 'CABLE Output' in dev['name'] and dev['max_input_channels'] == 16:
+                return i
+        return None
+
+    def analyze_chunk(self, indata, frames, time_info, status):
+        mono = np.mean(indata, axis=1)
+        N = 4096 * 2
+        fft = np.abs(np.fft.rfft(mono, n=N))
+        freqs = np.fft.rfftfreq(N, d=1 / SAMPLE_RATE)
+
+        band_edges = get_weighted_band_edges(MIN_FREQ, MAX_FREQ, BAR_COUNT, low_bias=0.8)
+        band_centers = np.sqrt(band_edges[:-1] * band_edges[1:])
+        bin_indices = np.digitize(freqs, band_edges) - 1
+
+        amps = np.array([
+            np.mean(fft[bin_indices == i]) if np.any(bin_indices == i) else 0
+            for i in range(BAR_COUNT)
+        ])
+
+        amps *= np.sqrt(band_centers / band_centers[0])
+
+        if np.max(amps) < 1e-4:
+            amps = np.zeros(BAR_COUNT)
+
+        max_fft = np.max(amps)
+        proportional = 2.0 # if max_fft > self.max_seen else 2.0
+        self.control, self.error, self.integral = pid_controller(max_fft, self.max_seen, proportional, 0.0, 0.02, self.error, self.integral, self.delta/1000)
+        self.max_seen += self.control * self.delta/1000 # max_fft
+        self.max_seen = max(self.max_seen, MIN_MAX_SEEN)
+        self.min_seen = np.min(amps)
+
+        amps = np.clip(amps / self.max_seen, 0, 1)
+        vocal_indices = np.where((band_centers >= VOCAL_MIN) & (band_centers <= VOCAL_MAX))[0]
+
+        if len(vocal_indices) and np.max(amps[vocal_indices]) > 0.1:
+            self.detect_harmonics(amps, band_centers)
+            self.highlighted_idx = vocal_indices[np.argmax(amps[vocal_indices])]
+        else:
+            self.highlighted_idx = None
+
+        self.amps = amps
+        #self.highlighted_freq, self.peak_conf = self.hps_pitch_detection_with_confidence(fft, SAMPLE_RATE, N, 4)
+        #self.highlighted_freq = self.find_peak_frequency(fft, freqs, band_edges, band_centers)
+        #self.detect_harmonics(amps, band_centers)
+
+    def find_peak_frequency(self, fft, freqs, band_edges, band_centers):
+        if self.highlighted_idx is None:
+            return None
+        start, end = band_edges[self.highlighted_idx:self.highlighted_idx + 2]
+        bins = np.where((freqs >= start) & (freqs < end))[0]
+        if bins.size:
+            return freqs[bins[np.argmax(fft[bins])]]
+        return band_centers[self.highlighted_idx]
+
+    def detect_harmonics(self, amps, band_centers):
+        vocal_range = (band_centers >= VOCAL_MIN) & (band_centers <= VOCAL_MAX)
+        candidates = np.where((amps > 0.1) & vocal_range)[0]
+
+        best_score = 0
+        best_f0 = None
+        self.highlighted_freq = []
+        for idx in candidates:
+            f0 = band_centers[idx]
+            harmonics_found = 0
+            total_strength = 0
+
+            for h in range(2, 4):  # check 2nd–4th harmonics
+                harmonic_freq = f0 / h
+                if harmonic_freq < VOCAL_MIN / 5:
+                    continue
+                harmonic_idx = np.argmin(np.abs(band_centers - harmonic_freq))
+                if amps[harmonic_idx] > 0.1:
+                    if amps[harmonic_idx] > amps[idx]: # discard if harmonic is more than candidate
+                        continue
+                    harmonics_found += 1
+                    total_strength += amps[harmonic_idx]
+
+            score = harmonics_found + total_strength # blend quantity + intensity
+            if harmonics_found >= 2 and score > best_score and score > 2.0:
+                best_score = score
+                best_f0 = f0
+
+        # Set result
+        if best_f0:
+            self.is_harmonic = True
+        else:
+            self.is_harmonic = False
+
+    def hps_pitch_detection_with_confidence(self, magnitude_spectrum, sampling_rate, fft_size, num_harmonics=4, fmin=80, fmax=400):
+        hps_spec = magnitude_spectrum.copy()
+        for h in range(2, num_harmonics + 1):
+            decimated = magnitude_spectrum[::h]
+            hps_spec[:len(decimated)] *= decimated
+
+        freqs = np.fft.rfftfreq(fft_size, 1.0 / sampling_rate)
+        valid = (freqs >= fmin) & (freqs <= fmax)
+
+        hps_valid = hps_spec[valid]
+        if len(hps_valid) < 2:
+            return None, 0.0
+
+        peak_index = np.argmax(hps_valid)
+        peak_freq = freqs[valid][peak_index]
+
+        # Confidence as ratio of top two peaks
+        sorted_vals = np.sort(hps_valid)[::-1]
+        ratio = sorted_vals[0] / (sorted_vals[1] + 1e-6)
+        confidence = np.clip((ratio - 1) / 2.0, 0.0, 1.0)
+
+        return peak_freq, confidence
+
+
+    def update_smoothed(self):
+        for i in range(BAR_COUNT):
+            if self.amps[i] > self.smoothed_amps[i]:
+                self.smoothed_amps[i] = self.amps[i]
+                self.fall_velocity[i] = 0
+            else:
+                self.fall_velocity[i] += 0.003
+                fall_amount = max(0.005, self.fall_velocity[i])
+                self.smoothed_amps[i] = max(0, self.smoothed_amps[i] - fall_amount)
+
+class GLVisualizer(QOpenGLWidget):
+    def __init__(self, processor, parent=None):
+        logging.info("Initialising Visualiser")
+        super().__init__(parent)
+        self.processor = processor
+        self.rotation_offset = 0.0
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self.timer = QtCore.QTimer(timeout=self.update)
+        self.timer.start(UPDATE_INTERVAL)
+        self.bar_opacity = MAX_OPACITY
+        self.peak_marker_angle = None
+        self.peak_marker_opacity = 0.0
+        self.elapsed_time = QtCore.QTime.currentTime()
+        self.animated_bar_count = BAR_COUNT
+        self.animation_counter = 0
+        self.debug_print_delay = 0 # int(1000 / UPDATE_INTERVAL)
+        self.control = 0
+        self.error = 0
+        self.integral = 0
+        self.max_radius = 0.2
+        self.arc_point_count = ARC_POINT_COUNT
+        self.actual_col = 0.1
+        self.min_max_error = [0.0, 0.0]
+        self.peak_pid = 0.0
+
+    def initializeGL(self):
+        glEnable(GL_LINE_SMOOTH)
+        glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+
+    def resizeGL(self, w, h):
+        glViewport(0, 0, w, h)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        aspect = w / h if h != 0 else 1.0
+        glOrtho(-aspect, aspect, -1.0, 1.0, -1.0, 1.0)
+        glMatrixMode(GL_MODELVIEW)
+
+    def paintGL(self):
+        self.debug_print_delay += 1
+        new_time = QtCore.QTime.currentTime()
+        delta = self.elapsed_time.msecsTo(new_time)
+        self.processor.delta = delta
+        self.elapsed_time = new_time
+        if self.debug_print_delay >= int(1000 / UPDATE_INTERVAL):
+            print(f" ~fps: {int(1000 / delta):02d} ", end="\r")
+            self.debug_print_delay = 0
+        self.processor.update_smoothed()
+        glClearColor(0, 0, 0, 0)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        glLoadIdentity()
+
+        amps = self.processor.smoothed_amps
+
+        min_radius = 0.175 # 0.22
+        outer_radius = min_radius+(self.processor.max_seen / 300) * (0.5 - min_radius)
+        inner_radius = outer_radius - 0.02 # min_radius+(self.processor.max_seen / 300) * (0.5 - min_radius)
+        performance_offset = 0 # min(delta - 16, 0)
+        self.arc_point_count = max(ARC_POINT_COUNT - performance_offset, 2)
+        ring_bar_count = ARC_POINT_COUNT * 2 # (BAR_COUNT * 2) - performance_offset
+        if OUTLINE_SCALE > 1:
+            self.draw_ring(inner_radius-0.005, outer_radius+0.035, ring_bar_count, amps, outline=True)
+        self.draw_ring(inner_radius, outer_radius+0.03, ring_bar_count, amps)
+
+        bass_energy = np.prod(amps[:min(4, BAR_COUNT)])
+        self.rotation_offset += 0.003 + self.processor.error/40000 + min(bass_energy * 0.1, 0.01)
+        self.rotation_offset %= 2 * np.pi
+
+        min_value = 0.0
+
+        peak_index = self.processor.highlighted_idx
+        if peak_index:
+            proportional = 2.0
+            self.control, self.error, self.integral = pid_controller(peak_index, self.peak_pid, proportional, 0.0, 0.02, self.error, self.integral, delta/1000)
+            self.peak_pid += self.control * delta/1000 # max_fft
+
+        for i in range(self.animated_bar_count):
+            shifted_index = (i + (self.rotation_offset * BAR_COUNT / (2 * np.pi))) % BAR_COUNT
+
+            idx0 = int(np.floor(shifted_index))
+            idx1 = (idx0 + 1) % BAR_COUNT
+            frac = shifted_index - idx0
+            value = np.interp(frac, [0, 1], [amps[idx0], amps[idx1]]) * 1.00
+            value = max(value, MIN_BAR_HEIGHT)
+            min_value = max(value, min_value)
+            angle = (2 * np.pi * i) / BAR_COUNT + 1.5 * np.pi + self.rotation_offset
+
+            r, g, b = self.interpolate_hsv_3stop(value, LOW_COLOUR, MID_COLOUR, HIGH_COLOUR, self.hsv_to_rgb)
+            if peak_index and self.processor.is_harmonic:
+                blue_offset = 0
+                if abs(shifted_index - self.peak_pid) < 2:
+                    blue_offset = (2 - abs(shifted_index - self.peak_pid)) / 3
+                #blue_offset = max(0,((abs(shifted_index - peak_index)/BAR_COUNT*2)))
+                b += blue_offset
+            self.draw_rounded_polys(angle, value, (0.0, 0.0, 0.0, self.bar_opacity), (BAR_THICKNESS / 2) * OUTLINE_SCALE)
+            self.draw_rounded_polys(angle, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity), BAR_THICKNESS / 2)
+            #self.draw_bar(angle, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity))
+        lowering = False
+        if min_value > MIN_BAR_HEIGHT:
+            self.bar_opacity = MAX_OPACITY
+            self.last_valid_bar = QtCore.QTime.currentTime()
+        else:
+            if hasattr(self, 'last_valid_bar'):
+                elapsed = self.last_valid_bar.msecsTo(QtCore.QTime.currentTime()) / 1000.0
+                lowering = True
+                fade_duration = 4
+                if elapsed < fade_duration and elapsed > 0.4:
+                    #self.bar_opacity = MAX_OPACITY * (1 - (elapsed / fade_duration))
+                    self.bar_opacity = MAX_OPACITY * (1 - max(0, elapsed - fade_duration / 2) / (fade_duration / 2))
+                    self.animated_bar_count = int(BAR_COUNT * (1 - max(0, (elapsed - fade_duration / 2) / (fade_duration / 2))))
+                elif 0 <= elapsed <= 0.4:
+                    pass
+                else:
+                    self.animated_bar_count = 0
+                    self.bar_opacity = 0.0
+            else:
+                pass
+        if not lowering or np.min(amps) > MIN_BAR_HEIGHT / 10:
+            if self.animated_bar_count < BAR_COUNT:
+                self.animation_counter += 1
+                if self.animation_counter >= 4:
+                    self.animation_counter = 0
+                    self.animated_bar_count += 1
+                #print(self.animated_bar_count / BAR_COUNT)
+                self.bar_opacity = (self.animated_bar_count / BAR_COUNT) * MAX_OPACITY
+            else:
+                self.animation_counter = 0
+        #print(f"{self.animated_bar_count}, {self.animation_counter}, {min_value}, {np.min(amps)}")
+        #self.draw_peak_circle()
+
+    def draw_ring(self, inner_radius, outer_radius, segments, amps, outline=False):
+        glBegin(GL_TRIANGLE_STRIP)
+        #print(self.processor.error)
+        if self.processor.error > self.min_max_error[1]:
+            self.min_max_error[1] = self.processor.error
+        elif self.processor.error < self.min_max_error[0]:
+            self.min_max_error[0] = self.processor.error
+        self.min_max_error = [self.min_max_error[0]*0.999, self.min_max_error[1]*0.999]
+        target_col =  np.interp(self.processor.error, self.min_max_error, [0,1])
+        delta = self.actual_col - target_col
+        reaction = 0.02 if delta > 0 else 0.3
+        self.actual_col -= delta * reaction
+        #print(target_col, self.actual_col)
+        #r, g, b = self.hsv_to_rgb(self.actual_col, 1.0, 1.0) if not outline else (0.0, 0.0, 0.0)
+        r, g, b = self.interpolate_hsv_3stop(self.actual_col, LOW_COLOUR, MID_COLOUR, HIGH_COLOUR, self.hsv_to_rgb)
+        glColor4f(r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity)
+        for i in range(segments + 1):
+            if i == segments:
+                i = 0
+            angle = -(2 * np.pi * i / segments) + np.pi
+            x = np.cos(angle)
+            y = np.sin(angle)
+            frac = (BAR_COUNT / (segments + 1)) * i
+            l_interp = np.sqrt(np.interp(frac, np.arange(len(amps)), amps))
+            l_interp = max(l_interp, MIN_BAR_HEIGHT)
+            # Outer edge vertex
+            glVertex2f(x * (outer_radius + l_interp / 30), y * (outer_radius + l_interp / 30))
+            # Inner edge vertex
+            glVertex2f(x * (inner_radius + l_interp / 30), y * (inner_radius + l_interp / 30))
+        glEnd()
+
+    def draw_bar(self, angle, value, color):
+        base = 0.3 - value * 0.05
+        tip = base + value * 0.5
+        x0, y0 = np.sin(angle) * base, np.cos(angle) * base
+        x1, y1 = np.sin(angle) * tip, np.cos(angle) * tip
+        outline_x0, outline_y0 = np.sin(angle) * base * 0.98, np.cos(angle) * base * 0.98
+        outline_x1, outline_y1 = np.sin(angle) * tip * 1.02, np.cos(angle) * tip * 1.010
+        xtip, ytip = np.sin(angle) * (tip + 0.025), np.cos(angle) * (tip + 0.025)
+        outline_xtip, outline_ytip = np.sin(angle) * (tip + 0.03), np.cos(angle) * (tip + 0.035) 
+        
+        if ROUNDED_CAPS:
+            self.draw_rounded_bar(x0, y0, x1, y1, angle, color, value)
+        else:
+            dx, dy = BAR_THICKNESS / 2 * np.cos(-angle), BAR_THICKNESS / 2 * np.sin(-angle)
+            outline_dx, outline_dy = (BAR_THICKNESS / 2 * np.cos(-angle)) * OUTLINE_SCALE, (BAR_THICKNESS / 2 * np.sin(-angle)) * OUTLINE_SCALE
+            #outline_dx, outline_dy = BAR_THICKNESS / 2 * np.cos(-angle) * OUTLINE_SCALE, BAR_THICKNESS / 2 * np.sin(-angle) * OUTLINE_SCALE
+
+            vertices = [
+                (x0 - dx, y0 - dy), (x0 + dx, y0 + dy),
+                (x1 + dx, y1 + dy), (xtip, ytip), (x1 - dx, y1 - dy),
+                
+            ]
+            outline_vertices = [
+                (outline_x0 - outline_dx, outline_y0 - outline_dy), (outline_x0 + outline_dx, outline_y0 + outline_dy),
+                (outline_x1 + outline_dx, outline_y1 + outline_dy), (outline_xtip, outline_ytip), (outline_x1 - outline_dx, outline_y1 - outline_dy),
+            ]
+
+            if OUTLINE_SCALE >= 1:
+                glBegin(GL_POLYGON)
+                glColor4f(0.0, 0.0, 0.0, self.bar_opacity)
+                for x, y in outline_vertices:
+                    glVertex2f(x, y)
+                glEnd()
+
+            glBegin(GL_POLYGON)
+            glColor4f(*color)
+            for x, y in vertices:
+                glVertex2f(x, y)
+            glEnd()
+
+    def draw_rounded_polys(self, angle, value, color, radius):
+        base = 0.3 - value * 0.05
+        tip = base + value * 0.5
+        dx = radius * np.cos(-angle)
+        dy = radius * np.sin(-angle)
+        peak_dx = radius * np.cos(-angle) * (1+value*2.25)
+        peak_dy = radius * np.sin(-angle) * (1+value*2.25)
+        peak_radius = radius * (1+value*2)
+        x0, y0 = np.sin(angle) * base, np.cos(angle) * base
+        x1, y1 = np.sin(angle) * tip, np.cos(angle) * tip
+        bottom_left = (x0 - dx, y0 - dy)
+        bottom_right = (x0 + dx, y0 + dy)
+        top_right = (x1 + peak_dx, y1 + peak_dy)
+        top_left = (x1 - peak_dx, y1 - peak_dy)
+        vertices = [bottom_left]
+        for i in range(1,self.arc_point_count-1):
+            theta = np.pi * i / (self.arc_point_count - 1) + np.pi
+            x = x0 + radius * np.cos(theta - angle)
+            y = y0 + radius * np.sin(theta - angle)
+            vertices.append((x,y))
+        vertices.append(bottom_right)
+        vertices.append(top_right)
+        for i in range(1,self.arc_point_count-1):
+            theta = np.pi * i / (self.arc_point_count - 1)
+            x = x1 + (peak_radius) * np.cos(theta - angle)
+            y = y1 + (peak_radius) * np.sin(theta - angle)
+            vertices.append((x,y))
+        vertices.append(top_left)
+
+        glBegin(GL_POLYGON)
+        glColor4f(*color)
+        for x, y in vertices:
+            glVertex2f(x, y)
+        glEnd()
+
+    def draw_peak_circle(self, optional_marker_freq=None):
+        #print(self.processor.highlighted_freq)
+        #self.peak_marker_opacity = self.bar_opacity
+        held_freq = self.processor.highlighted_freq
+        conf = self.processor.peak_conf
+        '''if held_freq and self.processor.is_harmonic:
+            centers = np.sqrt(
+                get_weighted_band_edges(MIN_FREQ, MAX_FREQ, BAR_COUNT, 0.8)[:-1] *
+                get_weighted_band_edges(MIN_FREQ, MAX_FREQ, BAR_COUNT, 0.8)[1:]
+            )
+            try:
+                if optional_marker_freq:
+                    idx = np.argmin(np.abs(centers - optional_marker_freq))
+                else:
+                    idx = np.argmin(np.abs(centers - held_freq))
+            except TypeError as e:
+                print(f"potential race condition, highlighted_freq is {held_freq}")
+                return
+            target_angle = (2 * np.pi * idx) / BAR_COUNT + 1.5 * np.pi
+            if self.peak_marker_angle is None:
+                self.peak_marker_angle = target_angle
+            self.peak_marker_angle += (target_angle - self.peak_marker_angle) * 0.06
+            self.peak_marker_opacity = MAX_OPACITY
+            self.last_valid_marker = (self.peak_marker_angle, QtCore.QTime.currentTime())
+        else:
+            if hasattr(self, 'last_valid_marker'):
+                elapsed = self.last_valid_marker[1].msecsTo(QtCore.QTime.currentTime()) / 1000.0
+                fade_duration = 1.0  # seconds
+                if elapsed < fade_duration:
+                    self.peak_marker_angle = self.last_valid_marker[0]
+                    self.peak_marker_opacity = MAX_OPACITY * (1 - (elapsed / fade_duration))
+                else:
+                    self.peak_marker_opacity = 0.0
+                    return
+            else:
+                self.peak_marker_opacity = max(0.0, self.peak_marker_opacity - 0.005)
+                return'''
+        if conf > 0.5:
+            centers = np.sqrt(
+                    get_weighted_band_edges(MIN_FREQ, MAX_FREQ, BAR_COUNT, 0.8)[:-1] *
+                    get_weighted_band_edges(MIN_FREQ, MAX_FREQ, BAR_COUNT, 0.8)[1:]
+                )
+            idx = np.argmin(np.abs(centers - held_freq))
+            target_angle = (2 * np.pi * idx) / BAR_COUNT + 1.5 * np.pi
+
+            x = np.sin(target_angle) * MARKER_OFFSET
+            y = np.cos(target_angle) * MARKER_OFFSET
+            marker_radius = BAR_THICKNESS / 2
+
+            if OUTLINE_SCALE > 1:
+                glBegin(GL_POLYGON)
+                glColor4f(0.0, 0.0, 0.0, self.peak_marker_opacity)#self.peak_marker_opacity)
+                for j in range(self.arc_point_count * 2):
+                    theta = 2 * np.pi * j / (self.arc_point_count * 2)
+                    glVertex2f(x + marker_radius * OUTLINE_SCALE * np.cos(theta), y + marker_radius * OUTLINE_SCALE * np.sin(theta))
+                glEnd()
+
+            glBegin(GL_POLYGON)
+            r,g,b = self.hsv_to_rgb(self.peak_hue, 1, 1)
+            glColor4f(r*self.peak_marker_opacity, g*self.peak_marker_opacity, b*self.peak_marker_opacity, self.peak_marker_opacity)
+            #glColor4f(0.3 * self.peak_marker_opacity, 0.6 * self.peak_marker_opacity, 1 * self.peak_marker_opacity, self.peak_marker_opacity)
+            for j in range(self.arc_point_count * 2):
+                theta = 2 * np.pi * j / (self.arc_point_count * 2)
+                glVertex2f(x + marker_radius * np.cos(theta), y + marker_radius * np.sin(theta))
+            glEnd()
+
+    def pause_rendering(self):
+        if self.timer.isActive():
+            self.timer.stop()
+
+    def resume_rendering(self):
+        if not self.timer.isActive():
+            self.timer.start(UPDATE_INTERVAL)
+
+
+    @staticmethod
+    def hsv_to_rgb(h, s, v):
+        if h:
+            i = int(h * 6)
+            f = h * 6 - i
+            p, q, t = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
+            i %= 6
+            return [(v, t, p), (q, v, p), (p, v, t), (p, q, v), (t, p, v), (v, p, q)][i]
+        else:
+
+            return (1.0, 0.0, 0.0)
+        
+    def interpolate_hsv_3stop(self, value, low_hsv, mid_hsv, high_hsv, hsv_to_rgb):
+        """
+        Interpolates between three HSV color stops (h, s, v) where h ∈ [0, 1] and value ∈ [0, 1].
+
+        Args:
+            value (float): Input value in [0, 1]
+            low_hsv (tuple): HSV at value = 0
+            mid_hsv (tuple): HSV at value = 0.5
+            high_hsv (tuple): HSV at value = 1
+            hsv_to_rgb (function): A function that takes (h, s, v) and returns (r, g, b)
+
+        Returns:
+            tuple: Interpolated RGB tuple from your hsv_to_rgb()
+        """
+        def interpolate_hsv(a, b, t):
+            h1, s1, v1 = a
+            h2, s2, v2 = b
+
+            # Hue interpolation with circular wraparound
+            if abs(h2 - h1) > 0.5:
+                if h1 > h2:
+                    h2 += 1
+                else:
+                    h1 += 1
+            h = (1 - t) * h1 + t * h2
+            h = h % 1.0  # Wrap hue into [0, 1]
+
+            s = (1 - t) * s1 + t * s2
+            v = (1 - t) * v1 + t * v2
+
+            return (h, s, v)
+
+        if value <= 0.5:
+            t = value / 0.5
+            hsv = interpolate_hsv(low_hsv, mid_hsv, t)
+        else:
+            t = (value - 0.5) / 0.5
+            hsv = interpolate_hsv(mid_hsv, high_hsv, t)
+
+        return hsv_to_rgb(*hsv)
+        
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.processor = AudioProcessor()
+        self.visualizer = GLVisualizer(self.processor)
+        self.setCentralWidget(self.visualizer)
+        self.setWindowTitle("Sonic Halo: Real-Time Audio Visualizer")
+        self.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
+        self.max_bar_count = BAR_COUNT
+
+        self.stream = sd.InputStream(device=self.processor.device_index,
+                       channels=2,
+                       samplerate=SAMPLE_RATE,
+                       blocksize=CHUNK,
+                       callback=self.processor.analyze_chunk)
+        self.stream.start()
+
+    def keyPressEvent(self, event):
+        global BAR_COUNT, MAX_OPACITY, BAR_THICKNESS
+        if event.key() == QtCore.Qt.Key_P:
+            if self.windowFlags() & QtCore.Qt.FramelessWindowHint:
+                self.window_mode()
+                logging.info("Showing window")
+            else:
+                self.display_mode()
+                logging.info("Hiding window")
+        elif event.key() == QtCore.Qt.Key_Down:
+            BAR_COUNT -= 1
+            #BAR_THICKNESS += 0.01
+            logging.info(f"Updated BAR_COUNT: {BAR_COUNT}")
+        elif event.key() == QtCore.Qt.Key_Up:
+            if BAR_COUNT < self.max_bar_count:
+                BAR_COUNT += 0
+                logging.info(f"Updated BAR_COUNT: {BAR_COUNT}")
+        elif event.key() == QtCore.Qt.Key_0:
+            if round(MAX_OPACITY, 1) > 0.1:
+                MAX_OPACITY -= 0.1
+                logging.info(f"Updated MAX_OPACITY: {round(MAX_OPACITY, 1)}")
+        elif event.key() == QtCore.Qt.Key_1:
+            if round(MAX_OPACITY, 1) < 1.0:
+                MAX_OPACITY += 0.1
+                logging.info(f"Updated MAX_OPACITY: {round(MAX_OPACITY, 1)}")
+        elif event.key() == QtCore.Qt.Key_Escape:
+            self.close()
+
+    def display_mode(self):
+        pos = self.pos()
+        self.visualizer.pause_rendering()
+        #time.sleep(0.5)
+
+        self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self.show()
+        pos.setY(pos.y() - 1)
+        self.move(pos)
+
+        # Delay Win32 manipulation until Qt stabilizes
+        #QtCore.QTimer.singleShot(50, lambda: make_window_clickthrough(self))
+        #QtCore.QTimer.singleShot(500, lambda: self.visualizer.resume_rendering())
+        make_window_clickthrough(self)
+        self.visualizer.resume_rendering()
+
+
+    def window_mode(self):
+        pos = self.pos()
+        self.visualizer.pause_rendering()
+        #time.sleep(0.5)
+
+        self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.WindowStaysOnTopHint)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, False)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
+        self.show()
+        pos.setX(pos.x() - 8)
+        pos.setY(pos.y() - 30)
+        self.move(pos)
+
+        #QtCore.QTimer.singleShot(50, lambda: make_window_clickable(self))
+        #QtCore.QTimer.singleShot(500, lambda: self.visualizer.resume_rendering())
+        make_window_clickable(self)
+        self.visualizer.resume_rendering()
+
+
+    def centered_setText(self, text):
+        def update():
+            self.label.setText(text)
+            self.label.adjustSize()
+            label_width = self.label.width()
+            label_height = self.label.height()
+            win_width = self.width()
+            win_height = self.height()
+            self.label.move((win_width - label_width) // 2, (win_height - label_height) // 2)
+        QtCore.QMetaObject.invokeMethod(self, update, QtCore.Qt.QueuedConnection)
+
+if __name__ == '__main__':
+    fmt = QtGui.QSurfaceFormat()
+    fmt.setAlphaBufferSize(8)
+    QtGui.QSurfaceFormat.setDefaultFormat(fmt)
+    app = QtWidgets.QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
