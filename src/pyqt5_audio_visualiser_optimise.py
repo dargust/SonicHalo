@@ -8,6 +8,7 @@ from OpenGL.GL import *
 import ctypes, logging, json, os
 import platformdirs.windows
 import time
+import asyncio
 
 logging.basicConfig(level=logging.DEBUG,
                     format="{levelname} - {message}",
@@ -134,7 +135,45 @@ def pid_controller(setpoint, pv, kp, ki, kd, previous_error, integral, dt):
         return control, error, integral
     except ValueError:
         return 0.0, 0.0, 0.0
-    
+
+class SongPoller(QtCore.QThread):
+    song_changed = QtCore.pyqtSignal(str)
+
+    def __init__(self, poll_interval=2.0, parent=None):
+        super().__init__(parent)
+        self.poll_interval = poll_interval
+        self._running = True
+        self._last_song = None
+
+    def run(self):
+        while self._running:
+            song = self.get_current_song()
+            if song and song != self._last_song:
+                self._last_song = song
+                self.song_changed.emit(song)
+            self.msleep(int(self.poll_interval * 1000))
+
+    def stop(self):
+        self._running = False
+
+    def get_current_song(self):
+        if ON_WINDOWS and MediaManager is not None:
+            try:
+                import asyncio
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                sessions = loop.run_until_complete(MediaManager.request_async())
+                current_session = sessions.get_current_session()
+                if current_session:
+                    info = loop.run_until_complete(current_session.try_get_media_properties_async())
+                    artist = getattr(info, "artist", "")
+                    title = getattr(info, "title", "")
+                    if title:
+                        return f"{artist} - {title}" if artist else title
+            except Exception as e:
+                logging.debug(f"Song poll error: {e}")
+        return None
+
 class DevicesMap:
     VIRTUAL_CABLE = "CABLE Output (VB-Audio Virtual Cable)"
     STEREO_MIX = "Stereo Mix"
@@ -232,15 +271,19 @@ class AudioProcessor:
     def bpm_detect(self):
         # Detect BPM by analyzing the timing of rising edges in the error signal.
         # Try to filter out off-beats by looking for a repeating interval pattern.
-        deadzone = 30  # Sensitivity for peak detection
+        deadzone = 50  # Sensitivity for peak detection
         now = time.time()
+
+        if not hasattr(self, "locked_bpm"):
+            self.locked_bpm = None
+            self.locked_bpm_time = 0
 
         if self.bpm_peak_direction == 0:
             if self.error > deadzone:  # rising edge
                 self.bpm_peak_direction = 1
                 self.bpm_timestamps.append(now)
                 #logging.debug(f"rise detected@{now}")
-                if len(self.bpm_timestamps) > 16:
+                if len(self.bpm_timestamps) > 14:
                     self.bpm_timestamps.pop(0)
                 if len(self.bpm_timestamps) < 4:
                     return 0
@@ -248,7 +291,7 @@ class AudioProcessor:
                 # Calculate intervals between peaks
                 intervals = np.diff(self.bpm_timestamps)
                 # Filter out intervals that are too short/long
-                intervals = intervals[(intervals > 0.25) & (intervals < 2.0)]
+                intervals = intervals[(intervals > 0.3) & (intervals < 2.0)]
                 if len(intervals) < 2:
                     return 0
 
@@ -267,14 +310,41 @@ class AudioProcessor:
                     main_interval = np.mean(intervals[in_bin])
                 else:
                     main_interval = (bin_edges[max_bin] + bin_edges[max_bin + 1]) / 2
-                bpm = 60.0 / main_interval
-                if bpm < 40 or bpm > 200:
+                detected_bpm = 60.0 / main_interval
+                if detected_bpm < 40 or detected_bpm > 200:
                     return 0  # Ignore unrealistic BPM values
-                self.bpm = bpm
-                #logging.info(f"Estimated BPM: {bpm:.2f}")
+
+                # --- BPM Locking Logic ---
+                def is_multiple_or_submultiple(new_bpm, locked_bpm, tol=0.03):
+                    # Check if new_bpm is a multiple or submultiple of locked_bpm within tolerance
+                    ratio = new_bpm / locked_bpm
+                    for factor in [0.5, 1, 2, 3, 4]:
+                        if abs(ratio - factor) < tol:
+                            return factor
+                    return None
+
+                if self.locked_bpm is None or (now - self.locked_bpm_time > 10):
+                    # No BPM locked, or lock expired: lock to current detected BPM
+                    self.locked_bpm = detected_bpm
+                    self.locked_bpm_time = now
+                    self.bpm = detected_bpm
+                else:
+                    factor = is_multiple_or_submultiple(detected_bpm, self.locked_bpm)
+                    if factor is not None:
+                        # If detected BPM is a multiple/submultiple, keep root BPM
+                        self.bpm = self.locked_bpm
+                        self.locked_bpm_time = now
+                    else:
+                        # If not related, relock to new BPM after a timeout
+                        if now - self.locked_bpm_time > 10:
+                            self.locked_bpm = detected_bpm
+                            self.locked_bpm_time = now
+                            self.bpm = detected_bpm
+                        else:
+                            self.bpm = self.locked_bpm
 
         elif self.bpm_peak_direction == 1:
-            if self.error < 0:  # falling edge
+            if self.error < -deadzone / 8:  # falling edge
                 self.bpm_peak_direction = 0
 
 
@@ -381,6 +451,22 @@ class GLVisualizer(QOpenGLWidget):
         self.actual_col = 0.1
         self.min_max_error = [0.0, 0.0]
         self.peak_pid = 0.0
+        self.current_song = ""
+        self.song_show_time = 0
+        self.song_fade_duration = 3.0  # seconds to show
+        self.song_fade_steps = 20
+        self.song_fade_step = 0
+        self.song_fade_timer = QtCore.QTimer(self)
+        self.song_fade_timer.timeout.connect(self._fade_song)
+        # Load pixel font once
+        font_path = "media/Px437_IBM_VGA_8x14.ttf"
+        font_id = QtGui.QFontDatabase.addApplicationFont(font_path)
+        if font_id != -1:
+            family = QtGui.QFontDatabase.applicationFontFamilies(font_id)[0]
+            self.song_font = QtGui.QFont(family, 32)
+        else:
+            # Fallback to a system font if loading fails
+            self.song_font = QtGui.QFont("Consolas", 32)
 
     def initializeGL(self):
         glEnable(GL_LINE_SMOOTH)
@@ -477,6 +563,7 @@ class GLVisualizer(QOpenGLWidget):
                     self.bar_opacity = 0.0
             else:
                 pass
+        self.draw_bpm_indicator(ring_bar_count)
         if not lowering or np.min(amps) > self.settings["MIN_BAR_HEIGHT"] / 10:
             if self.animated_bar_count < paint_bar_count:
                 self.animation_counter += 1
@@ -489,23 +576,88 @@ class GLVisualizer(QOpenGLWidget):
                 self.animation_counter = 0
         #print(f"{self.animated_bar_count}, {self.animation_counter}, {min_value}, {np.min(amps)}")
         #self.draw_peak_circle()
-        self.draw_bpm_indicator()
-    
-    def draw_bpm_indicator(self):
-        if self.processor.bpm > 0:
-            # Draw BPM text
-            bpm_text = f"{int(self.processor.bpm)} BPM"
-            font = QtGui.QFont("Consolas", 12)
-            metrics = QtGui.QFontMetrics(font)
-            text_width = metrics.horizontalAdvance(bpm_text)
-            text_height = metrics.height()
-
+        # Draw song overlay if needed
+        if self.current_song:
             painter = QtGui.QPainter(self)
             painter.setRenderHint(QtGui.QPainter.Antialiasing)
-            painter.setFont(font)
-            painter.setPen(QtGui.QColor(255, 255, 255, int(255 * self.bar_opacity)))
-            painter.drawText(int((self.width() - text_width) / 2), int((self.height() + text_height) / 2), bpm_text)
-            painter.end()
+            painter.setFont(self.song_font)
+            # Fade out
+            alpha = 255
+            if self.song_fade_step > 0:
+                alpha = int(255 * (1 - self.song_fade_step / self.song_fade_steps))
+                color = QtGui.QColor(255, 255, 255, alpha)
+                painter.setPen(color)
+                rect = self.rect()
+                painter.drawText(rect, QtCore.Qt.AlignCenter, self.current_song)
+                painter.end()
+    
+    def draw_bpm_indicator(self, segments):
+        bpm = self.processor.bpm
+        if bpm > 0:
+            beat_interval = 60.0 / bpm
+
+            # --- Smooth phase reset logic ---
+            # Initialize persistent attributes
+            if not hasattr(self, "bpm_pulse_phase"):
+                self.bpm_pulse_phase = 0.0
+            if not hasattr(self, "bpm_pulse_phase_target"):
+                self.bpm_pulse_phase_target = 0.0
+            if not hasattr(self, "last_bpm"):
+                self.last_bpm = bpm
+
+            # If BPM changes, set a new target phase (reset to 0)
+            if bpm != self.last_bpm:
+                self.last_bpm = bpm
+                # reset at a quarter phase
+                self.bpm_pulse_phase_target = 1  # Target phase is reset
+
+            # Advance both phases by frame time
+            delta_sec = self.processor.delta / 1000.0
+            self.bpm_pulse_phase += delta_sec
+            self.bpm_pulse_phase_target += delta_sec
+
+            # Wrap phases
+            while self.bpm_pulse_phase > beat_interval:
+                self.bpm_pulse_phase -= beat_interval
+            while self.bpm_pulse_phase_target > beat_interval:
+                self.bpm_pulse_phase_target -= beat_interval
+
+            # Smoothly interpolate phase toward target (lerp)
+            interp_speed = 0.15  # 0=instant, 1=never; lower is faster
+            self.bpm_pulse_phase += (self.bpm_pulse_phase_target - self.bpm_pulse_phase) * interp_speed
+
+            # Pulse value: 0 at start, 1 at beat, back to 0
+            pulse = 0.5 * (1 - np.cos(2 * np.pi * self.bpm_pulse_phase / beat_interval))
+
+            # Draw a pulsing polygon (hexagon) using OpenGL
+            center_x, center_y = 0.0, 0.0  # OpenGL center
+            base_radius = 0.1  # relative to OpenGL coordinates
+            pulse_radius = base_radius * (1 + 0.25 * pulse)
+            sides = segments  # Hexagon
+
+            # Outline
+            if self.settings["OUTLINE_SCALE"] >= 0.1:
+                glColor4f(0.0, 0.0, 0.0, self.bar_opacity)
+                glBegin(GL_POLYGON)
+                for i in range(sides):
+                    angle = 2 * np.pi * i / sides
+                    x = center_x + (pulse_radius + self.settings["OUTLINE_SCALE"] * 0.01) * np.cos(angle)
+                    y = center_y + (pulse_radius + self.settings["OUTLINE_SCALE"] * 0.01) * np.sin(angle)
+                    glVertex2f(x, y)
+                glEnd()
+
+            # Set color and alpha (match bar_opacity)
+            r, g, b = self.interpolate_hsv_3stop(self.actual_col, self.settings["LOW_COLOUR"], self.settings["MID_COLOUR"], self.settings["HIGH_COLOUR"], self.hsv_to_rgb)
+            glColor4f(r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity)
+            glLineWidth(2)
+            glBegin(GL_POLYGON)
+            for i in range(sides):
+                angle = 2 * np.pi * i / sides
+                x = center_x + pulse_radius * np.cos(angle)
+                y = center_y + pulse_radius * np.sin(angle)
+                glVertex2f(x, y)
+            glEnd()
+
 
     def draw_ring(self, inner_radius, outer_radius, segments, amps, outline=False):
         ring_bar_count = self.settings["BAR_COUNT"]
@@ -711,6 +863,24 @@ class GLVisualizer(QOpenGLWidget):
             hsv = interpolate_hsv(mid_hsv, high_hsv, t)
 
         return hsv_to_rgb(*hsv)
+    
+    def show_song(self, song):
+        # Truncate if too long
+        max_chars = 48  # or base on widget width
+        if len(song) > max_chars:
+            song = song[:max_chars - 3] + "..."
+        self.current_song = song
+        self.song_show_time = time.time()
+        self.song_fade_step = 0
+        self.song_fade_timer.start(int(self.song_fade_duration * 1000 / self.song_fade_steps))
+        self.update()
+
+    def _fade_song(self):
+        self.song_fade_step += 1
+        if self.song_fade_step >= self.song_fade_steps:
+            self.current_song = ""
+            self.song_fade_timer.stop()
+        self.update()
         
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -733,6 +903,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(self.settings_manager.settings["WINDOW_WIDTH"], self.settings_manager.settings["WINDOW_HEIGHT"])
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
         self.max_bar_count = self.visualizer.processor.init_bar_count
+
+        self.song_poller = SongPoller(poll_interval=2.0)
+        self.song_poller.song_changed.connect(self.visualizer.show_song)
+        self.song_poller.start()
 
         self.move(self.settings_manager.settings["WINDOW_POS_X"], self.settings_manager.settings["WINDOW_POS_Y"])
 
@@ -880,6 +1054,9 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def closeEvent(self, event):
         logging.info("Closing application")
+
+        self.song_poller.stop()
+        self.song_poller.wait()
         # Check if in display mode (frameless)
         if self.windowFlags() & QtCore.Qt.FramelessWindowHint:
             self.window_mode()
