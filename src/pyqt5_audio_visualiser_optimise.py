@@ -7,6 +7,7 @@ from PyQt5.QtWidgets import QOpenGLWidget
 from OpenGL.GL import *
 import ctypes, logging, json, os
 import platformdirs.windows
+import time
 
 logging.basicConfig(level=logging.DEBUG,
                     format="{levelname} - {message}",
@@ -159,6 +160,9 @@ class AudioProcessor:
         self.error = 0
         self.integral = 0
         self.delta = 16
+        self.bpm_peak_direction = 0
+        self.bpm_timestamps = []
+        self.bpm = 0.0
 
     def find_device(self):
         devices = sd.query_devices()
@@ -218,10 +222,61 @@ class AudioProcessor:
         else:
             self.highlighted_idx = None
 
+        self.bpm_detect()
+
         self.amps = amps.copy()
         #self.highlighted_freq, self.peak_conf = self.hps_pitch_detection_with_confidence(fft, SAMPLE_RATE, N, 4)
         #self.highlighted_freq = self.find_peak_frequency(fft, freqs, band_edges, band_centers)
         #self.detect_harmonics(amps, band_centers)
+
+    def bpm_detect(self):
+        # Detect BPM by analyzing the timing of rising edges in the error signal.
+        # Try to filter out off-beats by looking for a repeating interval pattern.
+        deadzone = 30  # Sensitivity for peak detection
+        now = time.time()
+
+        if self.bpm_peak_direction == 0:
+            if self.error > deadzone:  # rising edge
+                self.bpm_peak_direction = 1
+                self.bpm_timestamps.append(now)
+                #logging.debug(f"rise detected@{now}")
+                if len(self.bpm_timestamps) > 16:
+                    self.bpm_timestamps.pop(0)
+                if len(self.bpm_timestamps) < 4:
+                    return 0
+
+                # Calculate intervals between peaks
+                intervals = np.diff(self.bpm_timestamps)
+                # Filter out intervals that are too short/long
+                intervals = intervals[(intervals > 0.25) & (intervals < 2.0)]
+                if len(intervals) < 2:
+                    return 0
+
+                # Try to find the most common interval (mode) to avoid off-beats
+                # Use histogram binning to cluster similar intervals with finer bins
+                bin_width = 0.005  # finer bin width for higher resolution
+                bins = np.arange(0.25, 2.05 + bin_width, bin_width)
+                hist, bin_edges = np.histogram(intervals, bins=bins)
+                max_bin = np.argmax(hist)
+                if hist[max_bin] < 2:
+                    return 0  # Not enough consistent intervals
+
+                # Use the weighted average of intervals in the most common bin for better precision
+                in_bin = (intervals >= bin_edges[max_bin]) & (intervals < bin_edges[max_bin + 1])
+                if np.any(in_bin):
+                    main_interval = np.mean(intervals[in_bin])
+                else:
+                    main_interval = (bin_edges[max_bin] + bin_edges[max_bin + 1]) / 2
+                bpm = 60.0 / main_interval
+                if bpm < 40 or bpm > 200:
+                    return 0  # Ignore unrealistic BPM values
+                self.bpm = bpm
+                #logging.info(f"Estimated BPM: {bpm:.2f}")
+
+        elif self.bpm_peak_direction == 1:
+            if self.error < 0:  # falling edge
+                self.bpm_peak_direction = 0
+
 
     def find_peak_frequency(self, fft, freqs, band_edges, band_centers):
         if self.highlighted_idx is None:
@@ -434,6 +489,23 @@ class GLVisualizer(QOpenGLWidget):
                 self.animation_counter = 0
         #print(f"{self.animated_bar_count}, {self.animation_counter}, {min_value}, {np.min(amps)}")
         #self.draw_peak_circle()
+        self.draw_bpm_indicator()
+    
+    def draw_bpm_indicator(self):
+        if self.processor.bpm > 0:
+            # Draw BPM text
+            bpm_text = f"{int(self.processor.bpm)} BPM"
+            font = QtGui.QFont("Consolas", 12)
+            metrics = QtGui.QFontMetrics(font)
+            text_width = metrics.horizontalAdvance(bpm_text)
+            text_height = metrics.height()
+
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            painter.setFont(font)
+            painter.setPen(QtGui.QColor(255, 255, 255, int(255 * self.bar_opacity)))
+            painter.drawText(int((self.width() - text_width) / 2), int((self.height() + text_height) / 2), bpm_text)
+            painter.end()
 
     def draw_ring(self, inner_radius, outer_radius, segments, amps, outline=False):
         ring_bar_count = self.settings["BAR_COUNT"]
