@@ -26,11 +26,17 @@ if ON_WINDOWS:
 else:
     MediaManager = None
 
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
+
 DEBUG = True
 
 logging.info("Sonic Halo: Real-Time Audio Visualizer by Dacus")
 # Major.Minor.Patch.Build
-VERSION = "0.6.1.4"
+VERSION = "0.7.3.2"
 logging.info(f"Version: {VERSION}")
 logging.info(f"System platform: {sys.platform}")
 
@@ -63,6 +69,7 @@ class SettingsManager:
             "MID_COLOUR": (0.08, 0.41, 0.63),
             "HIGH_COLOUR": (0.99, 0.81, 0.63),
             "USER_AUDIO_DEVICE": None,  # e.g. "CABLE Output (VB-Audio Virtual Cable)"
+            "BPM_DETECTION_ENABLED": True,  # Toggle for BPM detection feature
             }
         self.default_settings = self.settings.copy()
 
@@ -144,8 +151,23 @@ class SongPoller(QtCore.QThread):
         self.poll_interval = poll_interval
         self._running = True
         self._last_song = None
+        self._loop = None
+        self._session_manager = None
+        self._session = None
 
     def run(self):
+        if ON_WINDOWS and MediaManager is not None:
+            import asyncio
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            try:
+                self._session_manager = self._loop.run_until_complete(MediaManager.request_async())
+                self._session = self._session_manager.get_current_session()
+            except Exception as e:
+                logging.debug(f"SongPoller: Failed to get session manager: {e}")
+                self._session_manager = None
+                self._session = None
+
         while self._running:
             song = self.get_current_song()
             if song and song != self._last_song:
@@ -157,21 +179,20 @@ class SongPoller(QtCore.QThread):
         self._running = False
 
     def get_current_song(self):
-        if ON_WINDOWS and MediaManager is not None:
+        if ON_WINDOWS and MediaManager is not None and self._loop:
             try:
-                import asyncio
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                sessions = loop.run_until_complete(MediaManager.request_async())
-                current_session = sessions.get_current_session()
-                if current_session:
-                    info = loop.run_until_complete(current_session.try_get_media_properties_async())
+                # Always get the current session (it may change)
+                if self._session_manager is not None:
+                    self._session = self._session_manager.get_current_session()
+                if self._session:
+                    info = self._loop.run_until_complete(self._session.try_get_media_properties_async())
                     artist = getattr(info, "artist", "")
                     title = getattr(info, "title", "")
                     if title:
                         return f"{artist} - {title}" if artist else title
             except Exception as e:
                 logging.debug(f"Song poll error: {e}")
+                self._session = None
         return None
 
 class DevicesMap:
@@ -261,7 +282,11 @@ class AudioProcessor:
         else:
             self.highlighted_idx = None
 
-        self.bpm_detect()
+        if self.settings.get("BPM_DETECTION_ENABLED", True):
+            self.bpm_detect()
+        else:
+            # Reset BPM when detection is disabled
+            self.bpm = 0
 
         self.amps = amps.copy()
         #self.highlighted_freq, self.peak_conf = self.hps_pitch_detection_with_confidence(fft, SAMPLE_RATE, N, 4)
@@ -269,74 +294,74 @@ class AudioProcessor:
         #self.detect_harmonics(amps, band_centers)
 
     def bpm_detect(self):
-        # Detect BPM by analyzing the timing of rising edges in the error signal.
-        # Try to filter out off-beats by looking for a repeating interval pattern.
-        deadzone = 50  # Sensitivity for peak detection
+        # Enhanced BPM detection that tries to identify downbeats and bar structure
+        deadzone = 32  # Sensitivity for peak detection
         now = time.time()
 
         if not hasattr(self, "locked_bpm"):
             self.locked_bpm = None
             self.locked_bpm_time = 0
+            self.beat_strengths = []  # Track the strength of each detected beat
+            self.downbeat_candidates = []  # Track potential downbeats
 
         if self.bpm_peak_direction == 0:
             if self.error > deadzone:  # rising edge
                 self.bpm_peak_direction = 1
                 self.bpm_timestamps.append(now)
-                #logging.debug(f"rise detected@{now}")
-                if len(self.bpm_timestamps) > 14:
+                self.beat_strengths.append(self.error)  # Store beat strength
+                
+                # Keep lists manageable
+                if len(self.bpm_timestamps) > 16:
                     self.bpm_timestamps.pop(0)
-                if len(self.bpm_timestamps) < 4:
+                    self.beat_strengths.pop(0)
+                
+                if len(self.bpm_timestamps) < 6:
                     return 0
 
-                # Calculate intervals between peaks
-                intervals = np.diff(self.bpm_timestamps)
-                # Filter out intervals that are too short/long
-                intervals = intervals[(intervals > 0.3) & (intervals < 2.0)]
-                if len(intervals) < 2:
+                # Identify potential downbeats (stronger beats)
+                self.identify_downbeats()
+                
+                # Calculate intervals using both all beats and downbeat candidates
+                all_intervals = np.diff(self.bpm_timestamps)
+                downbeat_intervals = np.diff(self.downbeat_candidates) if len(self.downbeat_candidates) > 1 else []
+                
+                # Try downbeat intervals first (they should give us bar-level tempo)
+                detected_bpm = 0
+                if len(downbeat_intervals) >= 2:
+                    detected_bpm = self.calculate_bpm_from_intervals(downbeat_intervals, "downbeats")
+                
+                # Fallback to all beats if downbeat detection fails
+                if detected_bpm == 0 and len(all_intervals) >= 3:
+                    detected_bpm = self.calculate_bpm_from_intervals(all_intervals, "all_beats")
+                
+                if detected_bpm == 0:
                     return 0
-
-                # Try to find the most common interval (mode) to avoid off-beats
-                # Use histogram binning to cluster similar intervals with finer bins
-                bin_width = 0.005  # finer bin width for higher resolution
-                bins = np.arange(0.25, 2.05 + bin_width, bin_width)
-                hist, bin_edges = np.histogram(intervals, bins=bins)
-                max_bin = np.argmax(hist)
-                if hist[max_bin] < 2:
-                    return 0  # Not enough consistent intervals
-
-                # Use the weighted average of intervals in the most common bin for better precision
-                in_bin = (intervals >= bin_edges[max_bin]) & (intervals < bin_edges[max_bin + 1])
-                if np.any(in_bin):
-                    main_interval = np.mean(intervals[in_bin])
-                else:
-                    main_interval = (bin_edges[max_bin] + bin_edges[max_bin + 1]) / 2
-                detected_bpm = 60.0 / main_interval
-                if detected_bpm < 40 or detected_bpm > 200:
-                    return 0  # Ignore unrealistic BPM values
 
                 # --- BPM Locking Logic ---
-                def is_multiple_or_submultiple(new_bpm, locked_bpm, tol=0.03):
-                    # Check if new_bpm is a multiple or submultiple of locked_bpm within tolerance
+                def is_multiple_or_submultiple(new_bpm, locked_bpm, tol=0.05):
                     ratio = new_bpm / locked_bpm
-                    for factor in [0.5, 1, 2, 3, 4]:
+                    for factor in [0.25, 0.5, 1, 2, 3, 4]:  # Added 0.25 for bar-level detection
                         if abs(ratio - factor) < tol:
                             return factor
                     return None
 
-                if self.locked_bpm is None or (now - self.locked_bpm_time > 10):
-                    # No BPM locked, or lock expired: lock to current detected BPM
+                if self.locked_bpm is None or (now - self.locked_bpm_time > 12):
                     self.locked_bpm = detected_bpm
                     self.locked_bpm_time = now
                     self.bpm = detected_bpm
                 else:
                     factor = is_multiple_or_submultiple(detected_bpm, self.locked_bpm)
                     if factor is not None:
-                        # If detected BPM is a multiple/submultiple, keep root BPM
-                        self.bpm = self.locked_bpm
+                        # If detecting bar-level tempo, multiply to get beat-level
+                        if factor == 0.25:
+                            self.bpm = self.locked_bpm
+                        elif factor == 0.5:
+                            self.bpm = self.locked_bpm  
+                        else:
+                            self.bpm = self.locked_bpm
                         self.locked_bpm_time = now
                     else:
-                        # If not related, relock to new BPM after a timeout
-                        if now - self.locked_bpm_time > 10:
+                        if now - self.locked_bpm_time > 12:
                             self.locked_bpm = detected_bpm
                             self.locked_bpm_time = now
                             self.bpm = detected_bpm
@@ -346,6 +371,60 @@ class AudioProcessor:
         elif self.bpm_peak_direction == 1:
             if self.error < -deadzone / 8:  # falling edge
                 self.bpm_peak_direction = 0
+
+    def identify_downbeats(self):
+        """Identify beats that are likely to be downbeats based on strength"""
+        if len(self.beat_strengths) < 4:
+            return
+        
+        self.downbeat_candidates = []
+        
+        # Look for beats that are significantly stronger than their neighbors
+        for i in range(2, len(self.beat_strengths) - 1):
+            current_strength = self.beat_strengths[i]
+            
+            # Compare with neighbors
+            prev_avg = np.mean(self.beat_strengths[max(0, i-2):i])
+            next_avg = np.mean(self.beat_strengths[i+1:min(len(self.beat_strengths), i+3)])
+            neighbor_avg = (prev_avg + next_avg) / 2
+            
+            # If this beat is significantly stronger, it might be a downbeat
+            if current_strength > neighbor_avg * 1.25:  # 25% stronger threshold
+                self.downbeat_candidates.append(self.bpm_timestamps[i])
+
+    def calculate_bpm_from_intervals(self, intervals, source_type):
+        """Calculate BPM from a set of intervals with improved filtering"""
+        # Filter realistic intervals
+        if source_type == "downbeats":
+            # Downbeats represent bars, so intervals should be longer
+            intervals = intervals[(intervals > 1.0) & (intervals < 8.0)]
+        else:
+            # Regular beats
+            intervals = intervals[(intervals > 0.3) & (intervals < 2.0)]
+            
+        if len(intervals) < 2:
+            return 0
+
+        # Use median instead of mode for more stable results
+        median_interval = np.median(intervals)
+        
+        # Also check if intervals cluster around the median
+        close_to_median = np.abs(intervals - median_interval) < 0.1
+        if np.sum(close_to_median) < max(2, len(intervals) * 0.6):
+            return 0  # Not enough consistent intervals
+        
+        # Calculate BPM
+        if source_type == "downbeats":
+            # Downbeats represent bars in 4/4 time, so multiply by 4
+            detected_bpm = (60.0 / median_interval) * 4
+        else:
+            detected_bpm = 60.0 / median_interval
+            
+        # Realistic BPM range
+        if detected_bpm < 60 or detected_bpm > 180:
+            return 0
+            
+        return detected_bpm
 
 
     def find_peak_frequency(self, fft, freqs, band_edges, band_centers):
@@ -456,17 +535,27 @@ class GLVisualizer(QOpenGLWidget):
         self.song_fade_duration = 3.0  # seconds to show
         self.song_fade_steps = 20
         self.song_fade_step = 0
+        self.song_fade_hold_steps = 20  # Number of steps to hold at full opacity
+        self.song_fade_hold_step = 0
         self.song_fade_timer = QtCore.QTimer(self)
         self.song_fade_timer.timeout.connect(self._fade_song)
-        # Load pixel font once
-        font_path = "media/Px437_IBM_VGA_8x14.ttf"
-        font_id = QtGui.QFontDatabase.addApplicationFont(font_path)
-        if font_id != -1:
-            family = QtGui.QFontDatabase.applicationFontFamilies(font_id)[0]
-            self.song_font = QtGui.QFont(family, 32)
-        else:
-            # Fallback to a system font if loading fails
-            self.song_font = QtGui.QFont("Consolas", 32)
+
+        # Load pixel font once - FIXED VERSION
+        try:
+            font_path = resource_path("media/Px437_IBM_VGA_8x14.ttf")  # Use forward slashes
+            logging.debug(f"Loading font from {font_path}")
+            font_id = QtGui.QFontDatabase.addApplicationFont(font_path)
+            if font_id != -1:
+                family = QtGui.QFontDatabase.applicationFontFamilies(font_id)[0]
+                self.song_font = QtGui.QFont(family, 32)
+            else:
+                logging.error(f"Failed to load font from {font_path}")
+                self.song_font = QtGui.QFont("Consolas", 32)  # Fallback font
+        except Exception as e:
+            logging.error(f"Error loading font: {e}")
+            self.song_font = QtGui.QFont("Consolas", 32)  # Fallback font
+        
+        logging.debug(f"Using font: {self.song_font.family()}")
 
     def initializeGL(self):
         glEnable(GL_LINE_SMOOTH)
@@ -590,6 +679,29 @@ class GLVisualizer(QOpenGLWidget):
                 rect = self.rect()
                 painter.drawText(rect, QtCore.Qt.AlignCenter, self.current_song)
                 painter.end()
+        
+        # Draw BPM indicator if enabled - DISABLED (OpenGL context issue)
+        if False: # self.settings["BPM_DETECTION_ENABLED"]:
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            
+            # Create a smaller font for BPM display
+            bpm_font = QtGui.QFont()
+            bpm_font.setPointSize(12)
+            bpm_font.setBold(True)
+            painter.setFont(bpm_font)
+            
+            # Set color (white with some transparency)
+            painter.setPen(QtGui.QColor(255, 255, 255, 180))
+            
+            # Position at top-left corner
+            if self.processor.bpm > 0:
+                bpm_text = f"BPM: {self.processor.bpm:.1f}"
+            else:
+                bpm_text = "BPM: --"
+            text_rect = QtCore.QRect(10, 10, 100, 30)
+            painter.drawText(text_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop, bpm_text)
+            painter.end()
     
     def draw_bpm_indicator(self, segments):
         bpm = self.processor.bpm
@@ -872,14 +984,20 @@ class GLVisualizer(QOpenGLWidget):
         self.current_song = song
         self.song_show_time = time.time()
         self.song_fade_step = 0
+        self.song_fade_hold_step = 0  # Reset hold counter
         self.song_fade_timer.start(int(self.song_fade_duration * 1000 / self.song_fade_steps))
+        logging.info(f"Now playing: {song}")
         self.update()
 
     def _fade_song(self):
-        self.song_fade_step += 1
-        if self.song_fade_step >= self.song_fade_steps:
-            self.current_song = ""
-            self.song_fade_timer.stop()
+        if self.song_fade_hold_step < self.song_fade_hold_steps:
+            self.song_fade_hold_step += 1
+            # Keep full opacity, don't increment fade step yet
+        else:
+            self.song_fade_step += 1
+            if self.song_fade_step >= self.song_fade_steps:
+                self.current_song = ""
+                self.song_fade_timer.stop()
         self.update()
         
 
@@ -899,6 +1017,26 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.visualizer = GLVisualizer(self.processor, settings=self.settings_manager.settings)
         self.setCentralWidget(self.visualizer)
+        
+        # Add BPM label overlay
+        self.bpm_label = QtWidgets.QLabel(self)
+        self.bpm_label.setStyleSheet("""
+            QLabel {
+                color: rgba(255, 255, 255, 180);
+                background-color: transparent;
+                font-weight: bold;
+                font-size: 12px;
+            }
+        """)
+        self.bpm_label.setGeometry(10, 10, 100, 30)
+        self.bpm_label.setText("BPM: --")
+        self.bpm_label.show()
+        
+        # Timer for updating BPM display
+        self.bpm_update_timer = QtCore.QTimer()
+        self.bpm_update_timer.timeout.connect(self.update_bpm_display)
+        self.bpm_update_timer.start(100)  # Update every 100ms
+        
         self.setWindowTitle("Sonic Halo: Real-Time Audio Visualizer")
         self.resize(self.settings_manager.settings["WINDOW_WIDTH"], self.settings_manager.settings["WINDOW_HEIGHT"])
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
@@ -998,6 +1136,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.settings_manager.settings["UPDATE_INTERVAL"] -= 1
                 logging.info(f"Updated UPDATE_INTERVAL: {self.settings_manager.settings['UPDATE_INTERVAL']}")
                 self.visualizer.timer.setInterval(self.settings_manager.settings["UPDATE_INTERVAL"])
+        elif event.key() == QtCore.Qt.Key_B:
+            # Toggle BPM detection
+            self.settings_manager.settings["BPM_DETECTION_ENABLED"] = not self.settings_manager.settings["BPM_DETECTION_ENABLED"]
+            bpm_status = "ENABLED" if self.settings_manager.settings["BPM_DETECTION_ENABLED"] else "DISABLED"
+            logging.info(f"BPM Detection: {bpm_status}")
+            # Save settings immediately when toggled
+            self.settings_manager.save_settings_to_file(self.settings_manager.settings)
+
+    def update_bpm_display(self):
+        """Update the BPM label display"""
+        if self.settings_manager.settings["BPM_DETECTION_ENABLED"] and self.processor.bpm > 0:
+            self.bpm_label.setText(f"BPM: {self.processor.bpm:.1f}")
+            self.bpm_label.setVisible(True)
+        elif self.settings_manager.settings["BPM_DETECTION_ENABLED"]:
+            self.bpm_label.setText("BPM: --")
+            self.bpm_label.setVisible(True)
+        else:
+            self.bpm_label.setVisible(False)
 
     def display_mode(self):
         pos = self.pos()
@@ -1086,7 +1242,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "S": "Decrease ARC_POINT_COUNT (bar roundness)",
             "F12": "Save current frame as PNG",
             "T": "Increase UPDATE_INTERVAL (slower updates)",
-            "G": "Decrease UPDATE_INTERVAL (faster updates)"
+            "G": "Decrease UPDATE_INTERVAL (faster updates)",
+            "B": "Toggle BPM detection on/off"
         }
         logging.info("Keybinds:")
         for key, desc in keybinds.items():

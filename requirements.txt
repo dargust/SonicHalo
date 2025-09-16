@@ -1,6 +1,8 @@
+glcontext
 numpy
+PyOpenGL
+PyQt5
+PyQt5-Qt5
+PyQt5_sip
 sounddevice
-pyopengl
-pyqt5
-platformdirs
-ctypes
+winsdk

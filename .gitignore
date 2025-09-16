@@ -2,3 +2,6 @@
 certs/
 build/
 sandbox.py
+*.spec
+venv_run.bat
+build_run.bat
