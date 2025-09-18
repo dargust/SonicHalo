@@ -48,7 +48,7 @@ DEBUG = True
 
 logging.info("Sonic Halo: Real-Time Audio Visualizer by Dacus")
 # Major.Minor.Patch.Build
-VERSION = "0.8.1.2"
+VERSION = "0.8.2.2"
 logging.info(f"Version: {VERSION}")
 logging.info(f"System platform: {sys.platform}")
 
@@ -81,7 +81,7 @@ class SettingsManager:
             "MID_COLOUR": (0.08, 0.41, 0.63),
             "HIGH_COLOUR": (0.99, 0.81, 0.63),
             "USER_AUDIO_DEVICE": None,  # e.g. "CABLE Output (VB-Audio Virtual Cable)"
-            "BPM_DETECTION_ENABLED": True,  # Toggle for BPM detection feature
+            "BPM_DETECTION_ENABLED": False,  # Toggle for BPM detection feature
             }
         self.default_settings = self.settings.copy()
 

@@ -14,19 +14,19 @@
         --shadow: rgba(38, 70, 83, 0.08);
       }
 
-      body {
-        margin: 0;
-        min-height: 100vh;
-        font-family: 'Segoe UI', 'Roboto', Arial, sans-serif;
-        background: linear-gradient(135deg, var(--sand) 0%, var(--sun) 60%, var(--clay) 100%);
-        color: var(--sky);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-      }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: 'Segoe UI', 'Roboto', Arial, sans-serif;
+      background: linear-gradient(135deg, #486ec2 0%, #e9c46a 100%);
+      color: var(--sky);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
 
       .container {
-        background: var(--white);
+        background: rgba(22, 22, 22, 0.8); /* 0.8 opacity */
         border-radius: 2rem;
         box-shadow: 0 8px 32px var(--shadow);
         padding: 3rem 2.5rem 2.5rem 2.5rem;
@@ -34,6 +34,8 @@
         width: 100%;
         text-align: center;
         transition: box-shadow 0.2s;
+        position: relative;
+        z-index: 10; /* Make sure content is above settings and video */
       }
 
       .container:hover {
@@ -51,7 +53,7 @@
 
       .subtitle {
         font-size: 1.1rem;
-        color: var(--sky);
+        color: rgba(207, 207, 205, 0.85);
         margin-bottom: 2rem;
         opacity: 0.85;
       }
@@ -81,23 +83,218 @@
         border-color: var(--clay);
       }
 
+      #bg-visualizer {
+        position: fixed;
+        top: 1vh;
+        left: 0;
+        width: 100vw;
+        height: 100vh;
+        object-fit: contain;
+        z-index: 0;
+        pointer-events: none; /* So it doesn't block clicks */
+        background: transparent;
+      }
+
+      .settings-bg {
+        position: fixed;
+        font-family: monospace;
+        font-size: 1.5rem;
+        color: #65b8da;
+        opacity: 0.3;
+        line-height: 2.25rem;
+        pointer-events: none;
+        user-select: none;
+        white-space: pre-line;
+        z-index: 2;
+        text-align: left;
+        max-width: 40vw;
+        font-weight: 600;
+        letter-spacing: 0.25em;
+      }
+
+      .settings-top-left {
+        top: 1.5rem;
+        left: 1.5rem;
+      }
+
+      .settings-bottom-right {
+        bottom: 1.5rem;
+        right: 1.5rem;
+        transform: rotate(180deg);
+        text-align: left;
+      }
+
       @media (max-width: 600px) {
         .container {
-          padding: 2rem 1rem 1.5rem 1rem;
-          max-width: 98vw;
+          padding: 1rem 1rem 1rem 1rem;
+          max-width: 10vw;
         }
         h1 {
           font-size: 2rem;
+        }
+        .settings-bg {
+          width: 90vw;
+          height: 90vw;
+          font-size: 0.8rem;
         }
       }
     </style>
   </head>
   <body>
+    <video id="bg-visualizer" autoplay loop muted playsinline>
+      <source src="media/sonichalo_demo.webm" type="video/webm">
+    </video>
     <div class="container">
       <h1>SonicHalo</h1>
       <div class="subtitle">
-        A modern audio visualizer inspired by the colors and spirit of <strong>Journey</strong>.
+        Live audio visualizer for Windows, built with PyQt5 and PyAudio.
+        <br><br>
+        Can be placed anywhere on the desktop, reacts to all system audio played through default output
       </div>
+        <div class="powered">
+            github <a href="https://github.com/dargust/SonicHalo">SonicHalo</a> |
+            executables <a href="https://github.com/dargust/SonicHalo/releases">here</a>
+        </div>
     </div>
+    <div class="settings-bg settings-top-left">
+      WINDOW_WIDTH: 400<br>
+      WINDOW_HEIGHT: 400<br>
+      WINDOW_POS_X: 100<br>
+      WINDOW_POS_Y: 100<br>
+      BAR_COUNT: 28<br>
+      SAMPLE_RATE: 48000<br>
+      CHUNK: 2048<br>
+      UPDATE_INTERVAL: 16<br>
+      BAR_THICKNESS: 0.04<br>
+      MIN_BAR_HEIGHT: 0.03<br>
+      MIN_FREQ: 50<br>
+      MAX_FREQ: 12000<br>
+      VOCAL_MIN: 200<br>
+      VOCAL_MAX: 2200<br>
+      HARMONIC_THRESHOLD: 0.1<br>
+      MIN_MAX_SEEN: 10.0<br>
+      ROUNDED_CAPS: False<br>
+      MAX_OPACITY: 0.4<br>
+      OUTLINE_SCALE: 0.0<br>
+      ARC_POINT_COUNT: 3<br>
+      MARKER_OFFSET: 0.3<br>
+      LOW_COLOUR: (0.00, 0.15, 0.31)<br>
+      MID_COLOUR: (0.08, 0.41, 0.63)<br>
+      HIGH_COLOUR: (0.99, 0.81, 0.63)<br>
+      USER_AUDIO_DEVICE: None<br>
+      BPM_DETECTION_ENABLED: True
+    </div>
+    <div class="settings-bg settings-bottom-right">
+      WINDOW_WIDTH: 400<br>
+      WINDOW_HEIGHT: 400<br>
+      WINDOW_POS_X: 100<br>
+      WINDOW_POS_Y: 100<br>
+      BAR_COUNT: 28<br>
+      SAMPLE_RATE: 48000<br>
+      CHUNK: 2048<br>
+      UPDATE_INTERVAL: 16<br>
+      BAR_THICKNESS: 0.04<br>
+      MIN_BAR_HEIGHT: 0.03<br>
+      MIN_FREQ: 50<br>
+      MAX_FREQ: 12000<br>
+      VOCAL_MIN: 200<br>
+      VOCAL_MAX: 2200<br>
+      HARMONIC_THRESHOLD: 0.1<br>
+      MIN_MAX_SEEN: 10.0<br>
+      ROUNDED_CAPS: False<br>
+      MAX_OPACITY: 0.4<br>
+      OUTLINE_SCALE: 0.0<br>
+      ARC_POINT_COUNT: 3<br>
+      MARKER_OFFSET: 0.3<br>
+      LOW_COLOUR: (0.00, 0.15, 0.31)<br>
+      MID_COLOUR: (0.08, 0.41, 0.63)<br>
+      HIGH_COLOUR: (0.99, 0.81, 0.63)<br>
+      USER_AUDIO_DEVICE: None<br>
+      BPM_DETECTION_ENABLED: True
+    </div>
+    <script>
+// filepath: c:\Users\Dacus\Desktop\DEV\audio_vis\index.html
+// Settings to animate (key: [start, end])
+const animatedSettings = [
+  { key: "WINDOW_WIDTH", value: 400 },
+  { key: "WINDOW_HEIGHT", value: 400 },
+  { key: "WINDOW_POS_X", value: 100 },
+  { key: "WINDOW_POS_Y", value: 100 },
+  { key: "BAR_COUNT", value: 28 },
+  { key: "SAMPLE_RATE", value: 48000 },
+  { key: "CHUNK", value: 2048 },
+  { key: "UPDATE_INTERVAL", value: 16 },
+  { key: "BAR_THICKNESS", value: 0.04 },
+  { key: "MIN_BAR_HEIGHT", value: 0.03 },
+  { key: "MIN_FREQ", value: 50 },
+  { key: "MAX_FREQ", value: 12000 },
+  { key: "VOCAL_MIN", value: 200 },
+  { key: "VOCAL_MAX", value: 2200 },
+  { key: "HARMONIC_THRESHOLD", value: 0.1 },
+  { key: "MIN_MAX_SEEN", value: 10.0 },
+  { key: "ROUNDED_CAPS", value: "False" },
+  { key: "MAX_OPACITY", value: 0.4 },
+  { key: "OUTLINE_SCALE", value: 0.0 },
+  { key: "ARC_POINT_COUNT", value: 3 },
+  { key: "MARKER_OFFSET", value: 0.3 },
+  { key: "LOW_COLOUR", value: "(0.00, 0.15, 0.31)" },
+  { key: "MID_COLOUR", value: "(0.08, 0.41, 0.63)" },
+  { key: "HIGH_COLOUR", value: "(0.99, 0.81, 0.63)" },
+  { key: "USER_AUDIO_DEVICE", value: "None" },
+  { key: "BPM_DETECTION_ENABLED", value: "True" }
+];
+
+function randomizeValue(val) {
+  if (typeof val === "number") {
+    let s = val.toString();
+    return s.replace(/\d/g, () => Math.floor(Math.random() * 10));
+  }
+  if (typeof val === "string" && val.match(/^\d+(\.\d+)?$/)) {
+    return val.replace(/\d/g, () => Math.floor(Math.random() * 10));
+  }
+  return val;
+}
+
+function animateSettingLine(el, realVal, duration = 1800, interval = 80) {
+  let start = Date.now();
+  let timer = setInterval(() => {
+    let now = Date.now();
+    if (now - start > duration) {
+      el.textContent = realVal;
+      clearInterval(timer);
+    } else {
+      el.textContent = randomizeValue(realVal);
+    }
+  }, interval);
+}
+
+function setupAnimatedSettings() {
+  document.querySelectorAll('.settings-bg').forEach(bg => {
+    bg.innerHTML = "";
+    animatedSettings.forEach(setting => {
+      let line = document.createElement("div");
+      line.style.display = "block";
+      line.style.fontVariantNumeric = "tabular-nums";
+      line.innerHTML = `${setting.key}: <span class="setting-value">${setting.value}</span>`;
+      bg.appendChild(line);
+    });
+  });
+}
+
+// Randomly animate a setting every few seconds
+function startRandomSettingAnimation() {
+  const allSpans = Array.from(document.querySelectorAll('.setting-value'));
+  setInterval(() => {
+    const idx = Math.floor(Math.random() * allSpans.length);
+    const span = allSpans[idx];
+    const realVal = animatedSettings[idx].value;
+    animateSettingLine(span, realVal, 1800, 80);
+  }, 500 + Math.random() * 1800); // 0.5s to 2.3s
+}
+
+// Run on page load
+setupAnimatedSettings();
+startRandomSettingAnimation();
+</script>
   </body>
 </html>
