@@ -1,11 +1,103 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
   <head>
     <meta charset="UTF-8">
     <title>SonicHalo</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+      :root {
+        --sand: #e9c46a;
+        --sun: #f4a261;
+        --clay: #e76f51;
+        --sky: #264653;
+        --white: #fff8f0;
+        --shadow: rgba(38, 70, 83, 0.08);
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: 'Segoe UI', 'Roboto', Arial, sans-serif;
+        background: linear-gradient(135deg, var(--sand) 0%, var(--sun) 60%, var(--clay) 100%);
+        color: var(--sky);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .container {
+        background: var(--white);
+        border-radius: 2rem;
+        box-shadow: 0 8px 32px var(--shadow);
+        padding: 3rem 2.5rem 2.5rem 2.5rem;
+        max-width: 420px;
+        width: 100%;
+        text-align: center;
+        transition: box-shadow 0.2s;
+      }
+
+      .container:hover {
+        box-shadow: 0 12px 40px rgba(38, 70, 83, 0.16);
+      }
+
+      h1 {
+        font-size: 2.5rem;
+        font-weight: 700;
+        margin-bottom: 0.5rem;
+        letter-spacing: 0.03em;
+        color: var(--clay);
+        text-shadow: 0 2px 8px var(--shadow);
+      }
+
+      .subtitle {
+        font-size: 1.1rem;
+        color: var(--sky);
+        margin-bottom: 2rem;
+        opacity: 0.85;
+      }
+
+      .powered {
+        margin-top: 2.5rem;
+        font-size: 0.95rem;
+        color: var(--sun);
+        border-radius: 1rem;
+        background: rgba(244, 162, 97, 0.08);
+        padding: 0.6rem 1.2rem;
+        display: inline-block;
+        box-shadow: 0 1px 4px var(--shadow);
+        transition: background 0.2s;
+      }
+
+      .powered a {
+        color: var(--clay);
+        text-decoration: none;
+        font-weight: 600;
+        border-bottom: 1.5px solid var(--sand);
+        border-radius: 0.2em;
+        transition: border-color 0.2s;
+      }
+
+      .powered a:hover {
+        border-color: var(--clay);
+      }
+
+      @media (max-width: 600px) {
+        .container {
+          padding: 2rem 1rem 1.5rem 1rem;
+          max-width: 98vw;
+        }
+        h1 {
+          font-size: 2rem;
+        }
+      }
+    </style>
   </head>
   <body>
-    <h1>Welcome to SonicHalo</h1>
-    <p>Project powered by <a href="https://getsongbpm.com" target="_blank" rel="noopener">GetSongBPM API</a>.</p>
+    <div class="container">
+      <h1>SonicHalo</h1>
+      <div class="subtitle">
+        A modern audio visualizer inspired by the colors and spirit of <strong>Journey</strong>.
+      </div>
+    </div>
   </body>
 </html>
