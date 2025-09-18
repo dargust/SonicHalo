@@ -10,9 +10,21 @@ import platformdirs.windows
 import time
 import asyncio
 
-logging.basicConfig(level=logging.DEBUG,
+
+# --- Custom logging level for SETTINGS ---
+SETTINGS_LEVEL = 15  # Between INFO (20) and WARNING (30)
+logging.addLevelName(SETTINGS_LEVEL, "SETTINGS")
+
+def settings_log(self, message, *args, **kwargs):
+    if self.isEnabledFor(SETTINGS_LEVEL):
+        self._log(SETTINGS_LEVEL, message, args, **kwargs)
+logging.Logger.settings = settings_log
+
+logging.basicConfig(level=SETTINGS_LEVEL,
                     format="{levelname} - {message}",
                     style="{")
+
+logger = logging.getLogger()
 
 ON_WINDOWS = sys.platform.startswith('win')
 ON_LINUX = sys.platform.startswith('linux')
@@ -36,7 +48,7 @@ DEBUG = True
 
 logging.info("Sonic Halo: Real-Time Audio Visualizer by Dacus")
 # Major.Minor.Patch.Build
-VERSION = "0.7.3.2"
+VERSION = "0.8.1.2"
 logging.info(f"Version: {VERSION}")
 logging.info(f"System platform: {sys.platform}")
 
@@ -77,9 +89,9 @@ class SettingsManager:
 
         # Load settings from file or use defaults
         self.settings = self.load_settings_from_file()
-        logging.info("settings:")
+        logger.settings("settings:")
         for k,v in self.settings.items():
-            logging.info(f"    {k} = {v}")
+            logger.settings(f"    {k} = {v}")
 
     def save_settings_to_file(self, settings, filename="settings.json"):
         try:
@@ -225,6 +237,7 @@ class AudioProcessor:
         self.bpm = 0.0
 
     def find_device(self):
+        logging.info("Attempting to find audio input device, use settings USER_AUDIO_DEVICE to specify")
         devices = sd.query_devices()
         # Try priority devices first
         device_map = DevicesMap()
@@ -669,38 +682,20 @@ class GLVisualizer(QOpenGLWidget):
         if self.current_song:
             painter = QtGui.QPainter(self)
             painter.setRenderHint(QtGui.QPainter.Antialiasing)
-            painter.setFont(self.song_font)
-            # Fade out
+            # Dynamically scale font size based on window height (or width)
+            base_size = 12
+            scale = self.height() / 400  # 400 is your default window height
+            font_size = max(12, int(base_size * scale))
+            font = QtGui.QFont(self.song_font.family(), font_size)
+            painter.setFont(font)
+            # ...existing code for fading...
             alpha = 255
             if self.song_fade_step > 0:
                 alpha = int(255 * (1 - self.song_fade_step / self.song_fade_steps))
-                color = QtGui.QColor(255, 255, 255, alpha)
-                painter.setPen(color)
-                rect = self.rect()
-                painter.drawText(rect, QtCore.Qt.AlignCenter, self.current_song)
-                painter.end()
-        
-        # Draw BPM indicator if enabled - DISABLED (OpenGL context issue)
-        if False: # self.settings["BPM_DETECTION_ENABLED"]:
-            painter = QtGui.QPainter(self)
-            painter.setRenderHint(QtGui.QPainter.Antialiasing)
-            
-            # Create a smaller font for BPM display
-            bpm_font = QtGui.QFont()
-            bpm_font.setPointSize(12)
-            bpm_font.setBold(True)
-            painter.setFont(bpm_font)
-            
-            # Set color (white with some transparency)
-            painter.setPen(QtGui.QColor(255, 255, 255, 180))
-            
-            # Position at top-left corner
-            if self.processor.bpm > 0:
-                bpm_text = f"BPM: {self.processor.bpm:.1f}"
-            else:
-                bpm_text = "BPM: --"
-            text_rect = QtCore.QRect(10, 10, 100, 30)
-            painter.drawText(text_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop, bpm_text)
+            color = QtGui.QColor(255, 255, 255, alpha)
+            painter.setPen(color)
+            rect = self.rect()
+            painter.drawText(rect, QtCore.Qt.AlignCenter, self.current_song)
             painter.end()
     
     def draw_bpm_indicator(self, segments):
@@ -1060,52 +1055,52 @@ class MainWindow(QtWidgets.QMainWindow):
         if event.key() == QtCore.Qt.Key_P:
             if self.windowFlags() & QtCore.Qt.FramelessWindowHint:
                 self.window_mode()
-                logging.info("Showing window")
+                logger.info("Showing window")
             else:
                 self.display_mode()
-                logging.info("Hiding window border, making trasparent to mouse events")
+                logger.info("Hiding window border, making trasparent to mouse events")
         elif event.key() == QtCore.Qt.Key_Down:
             if self.settings_manager.settings["BAR_COUNT"] > 1:
                 self.settings_manager.settings["BAR_COUNT"] -= 1
                 printed_bar_count = self.settings_manager.settings["BAR_COUNT"]
-                logging.info(f"Updated BAR_COUNT: {printed_bar_count}")
+                logger.settings(f"Updated BAR_COUNT: {printed_bar_count}")
         elif event.key() == QtCore.Qt.Key_Up:
             if self.settings_manager.settings["BAR_COUNT"] < self.max_bar_count:
                 self.settings_manager.settings["BAR_COUNT"] += 1
                 printed_bar_count = self.settings_manager.settings["BAR_COUNT"]
-                logging.info(f"Updated BAR_COUNT: {printed_bar_count}")
+                logger.settings(f"Updated BAR_COUNT: {printed_bar_count}")
         elif event.key() == QtCore.Qt.Key_Left:
             if self.settings_manager.settings["BAR_THICKNESS"] > 0.001:
                 self.settings_manager.settings["BAR_THICKNESS"] = round(self.settings_manager.settings["BAR_THICKNESS"] - 0.001, 3)
                 printed_bar_thickness = self.settings_manager.settings["BAR_THICKNESS"]
-                logging.info(f"Updated BAR_THICKNESS: {printed_bar_thickness}")
+                logger.settings(f"Updated BAR_THICKNESS: {printed_bar_thickness}")
         elif event.key() == QtCore.Qt.Key_Right:
             if self.settings_manager.settings["BAR_THICKNESS"] < 100.0:
                 self.settings_manager.settings["BAR_THICKNESS"] = round(self.settings_manager.settings["BAR_THICKNESS"] + 0.001, 3)
                 printed_bar_thickness = self.settings_manager.settings["BAR_THICKNESS"]
-                logging.info(f"Updated BAR_THICKNESS: {printed_bar_thickness}")
+                logger.settings(f"Updated BAR_THICKNESS: {printed_bar_thickness}")
         elif event.key() == QtCore.Qt.Key_0:
             rounded_opacity = round(self.settings_manager.settings["MAX_OPACITY"], 1)
             if rounded_opacity > 0.1:
                 self.settings_manager.settings["MAX_OPACITY"] = round(self.settings_manager.settings["MAX_OPACITY"] - 0.1, 1)
                 rounded_opacity = self.settings_manager.settings["MAX_OPACITY"]
-                logging.info(f"Updated MAX_OPACITY: {rounded_opacity}")
+                logger.settings(f"Updated MAX_OPACITY: {rounded_opacity}")
         elif event.key() == QtCore.Qt.Key_1:
             rounded_opacity = round(self.settings_manager.settings["MAX_OPACITY"], 1)
             if rounded_opacity < 1.0:
                 self.settings_manager.settings["MAX_OPACITY"] = round(self.settings_manager.settings["MAX_OPACITY"] + 0.1, 1)
                 rounded_opacity = round(self.settings_manager.settings["MAX_OPACITY"], 1)
-                logging.info(f"Updated MAX_OPACITY: {rounded_opacity}")
+                logger.settings(f"Updated MAX_OPACITY: {rounded_opacity}")
         elif event.key() == QtCore.Qt.Key_I:
             if self.settings_manager.settings["OUTLINE_SCALE"] < 10.0:
                 self.settings_manager.settings["OUTLINE_SCALE"] = round(self.settings_manager.settings["OUTLINE_SCALE"] + 0.1, 2)
                 printed_outline_scale = self.settings_manager.settings["OUTLINE_SCALE"]
-                logging.info(f"Updated OUTLINE_SCALE: {printed_outline_scale}")
+                logger.settings(f"Updated OUTLINE_SCALE: {printed_outline_scale}")
         elif event.key() == QtCore.Qt.Key_K:
             if self.settings_manager.settings["OUTLINE_SCALE"] > 0.0:
                 self.settings_manager.settings["OUTLINE_SCALE"] = round(self.settings_manager.settings["OUTLINE_SCALE"] - 0.1, 2)
                 printed_outline_scale = self.settings_manager.settings["OUTLINE_SCALE"]
-                logging.info(f"Updated OUTLINE_SCALE: {printed_outline_scale}")
+                logger.settings(f"Updated OUTLINE_SCALE: {printed_outline_scale}")
         elif event.key() == QtCore.Qt.Key_R:
             self.settings_manager.settings = self.settings_manager.default_settings.copy()
         elif event.key() == QtCore.Qt.Key_Escape:
@@ -1113,36 +1108,44 @@ class MainWindow(QtWidgets.QMainWindow):
         elif event.key() == QtCore.Qt.Key_W:
             self.settings_manager.settings["ARC_POINT_COUNT"] += 1
             printed_arc_point_count = self.settings_manager.settings["ARC_POINT_COUNT"]
-            logging.info(f"Updated ARC_POINT_COUNT: {printed_arc_point_count}")
+            logger.settings(f"Updated ARC_POINT_COUNT: {printed_arc_point_count}")
         elif event.key() == QtCore.Qt.Key_S:
             self.settings_manager.settings["ARC_POINT_COUNT"] -= 1 if self.settings_manager.settings["ARC_POINT_COUNT"] > 1 else 0
             printed_arc_point_count = self.settings_manager.settings["ARC_POINT_COUNT"]
-            logging.info(f"Updated ARC_POINT_COUNT: {printed_arc_point_count}")
+            logger.settings(f"Updated ARC_POINT_COUNT: {printed_arc_point_count}")
         elif event.key() == QtCore.Qt.Key_F12:
             # Save current frame as PNG
             image = self.visualizer.grabFramebuffer()
             save_path = os.path.join(os.path.expanduser("~"), "sonic_halo_frame.png")
             image.save(save_path, "PNG")
-            logging.info(f"Frame saved to {save_path}")
+            logger.info(f"Frame saved to {save_path}")
         elif event.key() == QtCore.Qt.Key_T:
             # Increase UPDATE_INTERVAL (slower updates)
             if self.settings_manager.settings["UPDATE_INTERVAL"] < 1000:
                 self.settings_manager.settings["UPDATE_INTERVAL"] += 1
-                logging.info(f"Updated UPDATE_INTERVAL: {self.settings_manager.settings['UPDATE_INTERVAL']}")
+                logger.settings(f"Updated UPDATE_INTERVAL: {self.settings_manager.settings['UPDATE_INTERVAL']}")
                 self.visualizer.timer.setInterval(self.settings_manager.settings["UPDATE_INTERVAL"])
         elif event.key() == QtCore.Qt.Key_G:
             # Decrease UPDATE_INTERVAL (faster updates)
             if self.settings_manager.settings["UPDATE_INTERVAL"] > 1:
                 self.settings_manager.settings["UPDATE_INTERVAL"] -= 1
-                logging.info(f"Updated UPDATE_INTERVAL: {self.settings_manager.settings['UPDATE_INTERVAL']}")
+                logger.settings(f"Updated UPDATE_INTERVAL: {self.settings_manager.settings['UPDATE_INTERVAL']}")
                 self.visualizer.timer.setInterval(self.settings_manager.settings["UPDATE_INTERVAL"])
         elif event.key() == QtCore.Qt.Key_B:
             # Toggle BPM detection
             self.settings_manager.settings["BPM_DETECTION_ENABLED"] = not self.settings_manager.settings["BPM_DETECTION_ENABLED"]
             bpm_status = "ENABLED" if self.settings_manager.settings["BPM_DETECTION_ENABLED"] else "DISABLED"
-            logging.info(f"BPM Detection: {bpm_status}")
+            logger.settings(f"BPM Detection: {bpm_status}")
             # Save settings immediately when toggled
             self.settings_manager.save_settings_to_file(self.settings_manager.settings)
+        elif event.key() == QtCore.Qt.Key_L:
+            # Toggle logging level
+            if logger.level == logging.INFO:
+                logger.setLevel(SETTINGS_LEVEL)
+                logger.info("Logging level set to SETTINGS (settings logs enabled)")
+            else:
+                logger.setLevel(logging.INFO)
+                logger.info("Logging level set to INFO (settings logs disabled)")
 
     def update_bpm_display(self):
         """Update the BPM label display"""
