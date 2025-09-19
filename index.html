@@ -379,7 +379,7 @@ startRandomSettingAnimation();
 <script type="module">
   import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
-  // TODO: replace with your project details
+  // Supabase project configuration
   const supabaseUrl = 'https://egzjckfwywskgsybbhia.supabase.co';
   const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVnempja2Z3eXdza2dzeWJiaGlhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgyNzIzNDcsImV4cCI6MjA3Mzg0ODM0N30.TS7IyoXnazv-Hmvp635ED8B2QQDMX7uym3Q7Zeaowjg'; // safe to expose with proper RLS
 
@@ -396,6 +396,9 @@ startRandomSettingAnimation();
     const statusEl = $('auth-status');
     const oauthGithubBtn = $('btn-oauth-github');
     const oauthGoogleBtn = $('btn-oauth-google');
+
+    // Build a redirect URL that matches GitHub Pages path and includes trailing slash
+    const redirectTo = new URL('.', window.location.href).href;
 
     const setStatus = (text) => (statusEl.textContent = text);
     const setSignedInUI = (user) => {
@@ -417,16 +420,30 @@ startRandomSettingAnimation();
       setStatus('Not signed in');
     };
 
-    // Handle auth state at load
+    // On load: if returning from OAuth, finalize session; then init UI
     (async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      user ? setSignedInUI(user) : setSignedOutUI();
+      try {
+        const url = new URL(window.location.href);
+        if (url.searchParams.get('code')) {
+          setStatus('Finishing sign-in...');
+          const { error } = await supabase.auth.exchangeCodeForSession(window.location.href);
+          if (error) setStatus(`Error: ${error.message}`);
+        }
+      } catch (_) {}
+
+      const { data: { session } } = await supabase.auth.getSession();
+      session?.user ? setSignedInUI(session.user) : setSignedOutUI();
+
+      // Clean URL after OAuth (remove code/hash)
+      if (new URLSearchParams(window.location.search).get('code') || window.location.hash) {
+        history.replaceState({}, document.title, redirectTo);
+      }
     })();
 
-    // Sign up
+    // Email/Password: Sign up
     signupBtn?.addEventListener('click', async () => {
       setStatus('Signing up...');
-      const { data, error } = await supabase.auth.signUp({
+      const { error } = await supabase.auth.signUp({
         email: emailEl.value,
         password: passEl.value,
       });
@@ -434,7 +451,7 @@ startRandomSettingAnimation();
       setStatus('Check your email for confirmation.');
     });
 
-    // Sign in
+    // Email/Password: Sign in
     signinBtn?.addEventListener('click', async () => {
       setStatus('Signing in...');
       const { data, error } = await supabase.auth.signInWithPassword({
@@ -451,10 +468,7 @@ startRandomSettingAnimation();
       setSignedOutUI();
     });
 
-    // OAuth redirect URL (works on GitHub Pages):
-    const redirectTo = window.location.origin + window.location.pathname;
-
-    // OAuth GitHub
+    // OAuth buttons
     oauthGithubBtn?.addEventListener('click', async () => {
       setStatus('Redirecting to GitHub...');
       const { error } = await supabase.auth.signInWithOAuth({
@@ -464,7 +478,6 @@ startRandomSettingAnimation();
       if (error) setStatus(`Error: ${error.message}`);
     });
 
-    // OAuth Google
     oauthGoogleBtn?.addEventListener('click', async () => {
       setStatus('Redirecting to Google...');
       const { error } = await supabase.auth.signInWithOAuth({
@@ -474,18 +487,7 @@ startRandomSettingAnimation();
       if (error) setStatus(`Error: ${error.message}`);
     });
 
-    // Demo insert: requires a table with RLS allowing owner-only writes
-    // SQL (run in Supabase SQL editor):
-    // create table if not exists feedback (
-    //   id uuid primary key default gen_random_uuid(),
-    //   user_id uuid references auth.users(id) on delete cascade,
-    //   message text,
-    //   created_at timestamp with time zone default now()
-    // );
-    // alter table feedback enable row level security;
-    // create policy "Owner can insert" on feedback for insert with check ( auth.uid() = user_id );
-    // create policy "Owner can select" on feedback for select using ( auth.uid() = user_id );
-
+    // Demo insert (requires feedback table + RLS policies as commented below)
     saveBtn?.addEventListener('click', async () => {
       setStatus('Saving record...');
       const { data: session } = await supabase.auth.getUser();
@@ -498,16 +500,11 @@ startRandomSettingAnimation();
       setStatus('Saved!');
     });
 
-    // React to auth changes (e.g., confirmation)
+    // React to auth changes
     supabase.auth.onAuthStateChange((_event, session) => {
       const user = session?.user;
       user ? setSignedInUI(user) : setSignedOutUI();
     });
-
-    // Clean up post-OAuth URL fragment for nicer UX
-    if (window.location.hash.includes('access_token')) {
-      history.replaceState({}, document.title, redirectTo);
-    }
   }
 </script>
   </body>
