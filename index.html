@@ -83,6 +83,49 @@
         border-color: var(--clay);
       }
 
+      /* Auth UI */
+      .auth-panel {
+        margin-top: 1.5rem;
+        padding: 1rem;
+        background: rgba(255,255,255,0.08);
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 0.75rem;
+        text-align: left;
+      }
+      .auth-title {
+        font-size: 1rem;
+        font-weight: 700;
+        margin-bottom: 0.5rem;
+        color: #f0eadf;
+      }
+      .auth-row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; }
+      .auth-row input {
+        flex: 1 1 auto;
+        padding: 0.5rem 0.6rem;
+        border-radius: 0.5rem;
+        border: 1px solid rgba(255,255,255,0.18);
+        background: rgba(255,255,255,0.12);
+        color: #f7f7f5;
+        outline: none;
+      }
+      .auth-row input::placeholder { color: rgba(255,255,255,0.7); }
+      .auth-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+      .btn {
+        appearance: none;
+        border: 1px solid rgba(244, 162, 97, 0.6);
+        background: rgba(244, 162, 97, 0.15);
+        color: #ffd7b1;
+        padding: 0.45rem 0.8rem;
+        border-radius: 0.6rem;
+        cursor: pointer;
+      }
+      .btn.secondary {
+        border-color: rgba(38, 70, 83, 0.4);
+        background: rgba(38, 70, 83, 0.15);
+        color: #cde6ef;
+      }
+      .auth-status { margin-top: 0.6rem; font-size: 0.9rem; color: #e9c46a; }
+
       #bg-visualizer {
         position: fixed;
         top: 1vh;
@@ -168,6 +211,26 @@
         <div class="powered">
             github <a href="https://github.com/dargust/SonicHalo">SonicHalo</a> |
             executables <a href="https://github.com/dargust/SonicHalo/releases">here</a>
+        </div>
+
+        <!-- Minimal Auth: Static + BaaS (Supabase) -->
+        <div class="auth-panel" id="auth-panel">
+          <div class="auth-title">Sign in to save feedback</div>
+          <div class="auth-row">
+            <input id="auth-email" type="email" placeholder="Email" autocomplete="email">
+          </div>
+          <div class="auth-row">
+            <input id="auth-password" type="password" placeholder="Password" autocomplete="current-password">
+          </div>
+          <div class="auth-actions">
+            <button class="btn" id="btn-oauth-github" type="button">Continue with GitHub</button>
+            <button class="btn" id="btn-oauth-google" type="button">Continue with Google</button>
+            <button class="btn" id="btn-signup" type="button">Sign up</button>
+            <button class="btn" id="btn-signin" type="button">Sign in</button>
+            <button class="btn secondary" id="btn-signout" type="button" style="display:none">Sign out</button>
+            <button class="btn" id="btn-save" type="button" style="display:none">Save Demo Record</button>
+          </div>
+          <div class="auth-status" id="auth-status">Not signed in</div>
         </div>
     </div>
     <div class="settings-bg settings-top-left">
@@ -310,6 +373,142 @@ function startRandomSettingAnimation() {
 // Run on page load
 setupAnimatedSettings();
 startRandomSettingAnimation();
+</script>
+
+<!-- Supabase client: Static + BaaS auth and simple insert demo -->
+<script type="module">
+  import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+  // TODO: replace with your project details
+  const supabaseUrl = 'https://egzjckfwywskgsybbhia.supabase.co';
+  const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVnempja2Z3eXdza2dzeWJiaGlhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgyNzIzNDcsImV4cCI6MjA3Mzg0ODM0N30.TS7IyoXnazv-Hmvp635ED8B2QQDMX7uym3Q7Zeaowjg'; // safe to expose with proper RLS
+
+  if (!supabaseUrl.includes('YOUR-PROJECT')) {
+    const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+    const $ = (id) => document.getElementById(id);
+    const emailEl = $('auth-email');
+    const passEl = $('auth-password');
+    const signupBtn = $('btn-signup');
+    const signinBtn = $('btn-signin');
+    const signoutBtn = $('btn-signout');
+    const saveBtn = $('btn-save');
+    const statusEl = $('auth-status');
+    const oauthGithubBtn = $('btn-oauth-github');
+    const oauthGoogleBtn = $('btn-oauth-google');
+
+    const setStatus = (text) => (statusEl.textContent = text);
+    const setSignedInUI = (user) => {
+      signoutBtn.style.display = 'inline-block';
+      saveBtn.style.display = 'inline-block';
+      signupBtn.style.display = 'none';
+      signinBtn.style.display = 'none';
+      if (oauthGithubBtn) oauthGithubBtn.style.display = 'none';
+      if (oauthGoogleBtn) oauthGoogleBtn.style.display = 'none';
+      setStatus(`Signed in as ${user.email || user.id}`);
+    };
+    const setSignedOutUI = () => {
+      signoutBtn.style.display = 'none';
+      saveBtn.style.display = 'none';
+      signupBtn.style.display = 'inline-block';
+      signinBtn.style.display = 'inline-block';
+      if (oauthGithubBtn) oauthGithubBtn.style.display = 'inline-block';
+      if (oauthGoogleBtn) oauthGoogleBtn.style.display = 'inline-block';
+      setStatus('Not signed in');
+    };
+
+    // Handle auth state at load
+    (async () => {
+      const { data: { user } } = await supabase.auth.getUser();
+      user ? setSignedInUI(user) : setSignedOutUI();
+    })();
+
+    // Sign up
+    signupBtn?.addEventListener('click', async () => {
+      setStatus('Signing up...');
+      const { data, error } = await supabase.auth.signUp({
+        email: emailEl.value,
+        password: passEl.value,
+      });
+      if (error) return setStatus(`Error: ${error.message}`);
+      setStatus('Check your email for confirmation.');
+    });
+
+    // Sign in
+    signinBtn?.addEventListener('click', async () => {
+      setStatus('Signing in...');
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: emailEl.value,
+        password: passEl.value,
+      });
+      if (error) return setStatus(`Error: ${error.message}`);
+      setSignedInUI(data.user);
+    });
+
+    // Sign out
+    signoutBtn?.addEventListener('click', async () => {
+      await supabase.auth.signOut();
+      setSignedOutUI();
+    });
+
+    // OAuth redirect URL (works on GitHub Pages):
+    const redirectTo = window.location.origin + window.location.pathname;
+
+    // OAuth GitHub
+    oauthGithubBtn?.addEventListener('click', async () => {
+      setStatus('Redirecting to GitHub...');
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: 'github',
+        options: { redirectTo },
+      });
+      if (error) setStatus(`Error: ${error.message}`);
+    });
+
+    // OAuth Google
+    oauthGoogleBtn?.addEventListener('click', async () => {
+      setStatus('Redirecting to Google...');
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: { redirectTo, queryParams: { access_type: 'offline', prompt: 'consent' } },
+      });
+      if (error) setStatus(`Error: ${error.message}`);
+    });
+
+    // Demo insert: requires a table with RLS allowing owner-only writes
+    // SQL (run in Supabase SQL editor):
+    // create table if not exists feedback (
+    //   id uuid primary key default gen_random_uuid(),
+    //   user_id uuid references auth.users(id) on delete cascade,
+    //   message text,
+    //   created_at timestamp with time zone default now()
+    // );
+    // alter table feedback enable row level security;
+    // create policy "Owner can insert" on feedback for insert with check ( auth.uid() = user_id );
+    // create policy "Owner can select" on feedback for select using ( auth.uid() = user_id );
+
+    saveBtn?.addEventListener('click', async () => {
+      setStatus('Saving record...');
+      const { data: session } = await supabase.auth.getUser();
+      const user = session?.user;
+      if (!user) return setStatus('Please sign in first.');
+      const { error } = await supabase
+        .from('feedback')
+        .insert({ user_id: user.id, message: 'Hello from SonicHalo site' });
+      if (error) return setStatus(`Error: ${error.message}`);
+      setStatus('Saved!');
+    });
+
+    // React to auth changes (e.g., confirmation)
+    supabase.auth.onAuthStateChange((_event, session) => {
+      const user = session?.user;
+      user ? setSignedInUI(user) : setSignedOutUI();
+    });
+
+    // Clean up post-OAuth URL fragment for nicer UX
+    if (window.location.hash.includes('access_token')) {
+      history.replaceState({}, document.title, redirectTo);
+    }
+  }
 </script>
   </body>
 </html>
