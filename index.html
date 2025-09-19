@@ -319,8 +319,8 @@ startRandomSettingAnimation();
 <!-- Supabase lightweight analytics: pageviews + link clicks -->
 <script type="module">
   // Supabase REST endpoint config
-  const SUPABASE_URL = 'https://egzjckfwywskgsybbhia.supabase.co';
-  const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVnempja2Z3eXdza2dzeWJiaGlhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgyNzIzNDcsImV4cCI6MjA3Mzg0ODM0N30.TS7IyoXnazv-Hmvp635ED8B2QQDMX7uym3Q7Zeaowjg';
+  const SUPABASE_URL = 'https://yruactlzdaxbopxxiaoy.supabase.co';
+  const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlydWFjdGx6ZGF4Ym9weHhpYW95Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgyOTAxNTAsImV4cCI6MjA3Mzg2NjE1MH0.r5Zywgxj1HHnZA4rhDhF194vEg3HlTnjw1s2cS8xYOs';
   const TABLE = 'events';
 
   // Simple stable session id
@@ -347,20 +347,18 @@ startRandomSettingAnimation();
   // Send event via Supabase REST with keepalive, so it survives navigation
   async function sendEvent(event_name, payload = {}) {
     try {
-      const row = [{
+      const row = {
         session_id: getSessionId(),
-        user_id: null,
         event_name,
         page: location.pathname + location.search,
         referrer: document.referrer || null,
         ua_hash: hashStr(navigator.userAgent || ''),
         props: payload,
-      }];
+      };
       await fetch(`${SUPABASE_URL}/rest/v1/${TABLE}`, {
         method: 'POST',
         headers: {
           'apikey': SUPABASE_ANON_KEY,
-          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
           'Content-Type': 'application/json',
           'Prefer': 'resolution=merge-duplicates,return=minimal',
         },
