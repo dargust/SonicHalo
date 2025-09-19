@@ -124,6 +124,18 @@
         text-align: left;
       }
 
+      #terminal-screenshot {
+        position: fixed;
+        top: 1rem;
+        left: 1rem;
+        width: 35vw;           /* Less than a quarter of the screen width */
+        opacity: 0.8;
+        border-radius: 1.2rem;
+        z-index: 3;            /* Below settings (z-index:2) and container (z-index:10), above video (z-index:0) */
+        pointer-events: none;  /* So it doesn't block clicks */
+        box-shadow: 0 4px 24px var(--shadow);
+      }
+
       @media (max-width: 600px) {
         .container {
           padding: 1rem 1rem 1rem 1rem;
@@ -212,6 +224,7 @@
       USER_AUDIO_DEVICE: None<br>
       BPM_DETECTION_ENABLED: True
     </div>
+    <img id="terminal-screenshot" src="media/Capture.JPG" alt="Terminal Screenshot">
     <script>
 // filepath: c:\Users\Dacus\Desktop\DEV\audio_vis\index.html
 // Settings to animate (key: [start, end])
