@@ -56,7 +56,7 @@ DEBUG = True
 
 logging.info("Sonic Halo: Real-Time Audio Visualizer by Dacus")
 # Major.Minor.Patch.Build
-VERSION = "0.9.2.1"
+VERSION = "0.9.3.1"
 logging.info(f"Version: {VERSION}")
 logging.info(f"System platform: {sys.platform}")
 
@@ -91,7 +91,7 @@ class SettingsManager:
             "USER_AUDIO_DEVICE": None,  # e.g. "CABLE Output (VB-Audio Virtual Cable)"
             "BPM_DETECTION_ENABLED": False,  # Toggle for BPM detection feature
             "USE_SYSTEM_AUDIO": True,  # Use WASAPI loopback to capture system audio output
-            "SQUARE_MODE": False,  # Toggle between circular and square display
+            "SQUARE_MODE": False,  # Toggle between circular and linear bottom display
             "BAR_MAX_HEIGHT": 0.5,  # Maximum height bars can reach (0.1-1.0)
             "HEIGHT_SENSITIVITY": 0.5,  # Multiplier for bar height sensitivity (0.1-5.0)
             "BASE_ROTATION_SPEED": 0.001,  # Base rotation speed (constant rotation)
@@ -230,7 +230,7 @@ class DevicesMap:
         self.device_priority = [user_device] + self.device_priority if user_device else self.device_priority
 
 class AudioProcessor:
-    init_bar_count = 28 # settings["BAR_COUNT"]
+    init_bar_count = 64 # settings["BAR_COUNT"]
     def __init__(self, settings=None):
         logging.info("Initialising AudioProcessor")
         self.settings = settings if settings else {}
@@ -374,7 +374,8 @@ class AudioProcessor:
 
         # Apply height sensitivity and max height controls
         amps = np.clip(amps / self.max_seen, 0, 1)
-        amps = amps * self.settings["HEIGHT_SENSITIVITY"]
+        # Apply sensitivity scaling, linear for high, exponential for low
+        amps = amps * self.settings["HEIGHT_SENSITIVITY"] if self.settings["HEIGHT_SENSITIVITY"] >= 1.0 else amps ** (2.0 - self.settings["HEIGHT_SENSITIVITY"])
         amps = np.clip(amps, 0, self.settings["BAR_MAX_HEIGHT"])
         
         vocal_indices = np.where((band_centers >= self.settings["VOCAL_MIN"]) & (band_centers <= self.settings["VOCAL_MAX"]))[0]
@@ -692,7 +693,7 @@ class GLVisualizer(QOpenGLWidget):
 
         # Choose display mode based on SQUARE_MODE setting
         if self.settings["SQUARE_MODE"]:
-            self.draw_square_bars(amps, paint_bar_count)
+            self.draw_linear_bars(amps, paint_bar_count)
             ring_bar_count = paint_bar_count  # Use same count for BPM indicator
         else:
             # Original circular display
@@ -734,7 +735,11 @@ class GLVisualizer(QOpenGLWidget):
                 min_value = max(value, min_value)
                 angle = (2 * np.pi * i) / paint_bar_count + 1.5 * np.pi + self.rotation_offset
 
-                r, g, b = self.interpolate_hsv_3stop(value, self.settings["LOW_COLOUR"], self.settings["MID_COLOUR"], self.settings["HIGH_COLOUR"], self.hsv_to_rgb)
+                # Scale color value based on the actual displayable range (0 to BAR_MAX_HEIGHT)
+                # This ensures colors reach full range even when max height is limited
+                color_value = min(value / self.settings["BAR_MAX_HEIGHT"], 1.0)
+                
+                r, g, b = self.interpolate_hsv_3stop(color_value, self.settings["LOW_COLOUR"], self.settings["MID_COLOUR"], self.settings["HIGH_COLOUR"], self.hsv_to_rgb)
                 if peak_index and self.processor.is_harmonic:
                     blue_offset = 0
                     if abs(shifted_index - self.peak_pid) < 2:
@@ -1074,80 +1079,52 @@ class GLVisualizer(QOpenGLWidget):
 
         return hsv_to_rgb(*hsv)
     
-    def draw_square_bars(self, amps, bar_count):
-        """Draw bars in a square formation around the window edges"""
-        bars_per_side = bar_count // 4
-        remainder = bar_count % 4
-        
-        # Calculate how many bars on each side (distribute remainder)
-        sides = [bars_per_side] * 4
-        for i in range(remainder):
-            sides[i] += 1
-        
-        bar_index = 0
-        
-        # Define the four sides: top, right, bottom, left
-        for side in range(4):
-            for i in range(sides[side]):
-                if bar_index >= self.animated_bar_count:
-                    break
-                    
-                # Calculate position along the side (0 to 1)
-                t = i / max(1, sides[side] - 1) if sides[side] > 1 else 0.5
-                
-                # Get amplitude value with rotation offset
-                shifted_index = (bar_index + (self.rotation_offset * bar_count / (2 * np.pi))) % bar_count
-                idx0 = int(np.floor(shifted_index))
-                idx1 = (idx0 + 1) % bar_count
-                frac = shifted_index - idx0
-                value = np.interp(frac, [0, 1], [amps[idx0], amps[idx1]])
-                value = max(value, self.settings["MIN_BAR_HEIGHT"])
-                
-                # Calculate colors
-                r, g, b = self.interpolate_hsv_3stop(value, self.settings["LOW_COLOUR"], 
-                                                   self.settings["MID_COLOUR"], self.settings["HIGH_COLOUR"], self.hsv_to_rgb)
-                
-                # Draw bar based on which side we're on
-                self.draw_square_bar(side, t, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity))
-                
-                bar_index += 1
-                
-            if bar_index >= self.animated_bar_count:
-                break
-    
-    def draw_square_bar(self, side, position, height, color):
-        """Draw a single bar on one of the four sides of the square"""
+    def draw_linear_bars(self, amps, bar_count):
+        """Draw bars in a line across the bottom of the window"""
         aspect = self.width() / self.height() if self.height() > 0 else 1.0
-        margin = 0.1  # Distance from edge
-        bar_width = 0.03  # Width of each bar
-        max_bar_length = 0.3  # Maximum length bars can extend inward
+        margin = 0.1  # Distance from bottom edge
+        bar_spacing = (2 * aspect) / bar_count  # Total width divided by number of bars
+        bar_width = bar_spacing * 0.8  # Leave some space between bars
+        max_bar_height = 0.6  # Maximum height bars can reach
         
-        # Scale height by max bar length
-        bar_length = height * max_bar_length
+        # Start position (leftmost)
+        start_x = -aspect + bar_spacing / 2
         
-        if side == 0:  # Top side
-            x = -aspect + 2 * aspect * position
-            y1 = 1.0 - margin
-            y2 = y1 - bar_length
-            self.draw_rectangle(x - bar_width/2, y2, x + bar_width/2, y1, color)
+        for i in range(min(self.animated_bar_count, bar_count)):
+            # Get amplitude value without rotation offset for bottom line display
+            value = amps[i] if i < len(amps) else 0
+            value = max(value, self.settings["MIN_BAR_HEIGHT"])
             
-        elif side == 1:  # Right side  
-            x1 = aspect - margin
-            x2 = x1 - bar_length
-            y = 1.0 - 2.0 * position
-            self.draw_rectangle(x2, y - bar_width/2, x1, y + bar_width/2, color)
+            # Scale color value based on the actual displayable range (0 to BAR_MAX_HEIGHT)
+            # This ensures colors reach full range even when max height is limited
+            color_value = min(value / self.settings["BAR_MAX_HEIGHT"], 1.0)
             
-        elif side == 2:  # Bottom side
-            x = aspect - 2 * aspect * position
-            y1 = -1.0 + margin
-            y2 = y1 + bar_length
-            self.draw_rectangle(x - bar_width/2, y1, x + bar_width/2, y2, color)
+            # Calculate colors using the scaled value
+            r, g, b = self.interpolate_hsv_3stop(color_value, self.settings["LOW_COLOUR"], 
+                                               self.settings["MID_COLOUR"], self.settings["HIGH_COLOUR"], self.hsv_to_rgb)
             
-        elif side == 3:  # Left side
-            x1 = -aspect + margin
-            x2 = x1 + bar_length
-            y = -1.0 + 2.0 * position
-            self.draw_rectangle(x1, y - bar_width/2, x2, y + bar_width/2, color)
+            # Calculate bar position and dimensions
+            x = start_x + i * bar_spacing
+            bar_height = value * max_bar_height
+            y_bottom = -1.0 + margin
+            y_top = y_bottom + bar_height
+            
+            # Draw the bar
+            color_with_opacity = (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity)
+            
+            # Draw outline if enabled
+            if self.settings["OUTLINE_SCALE"] > 0.1:
+                outline_width = bar_width/2 + self.settings["OUTLINE_SCALE"] * 0.01
+                if self.settings["ROUNDED_CAPS"]:
+                    self.draw_rounded_rectangle(x - outline_width, y_bottom, x + outline_width, y_top, outline_width/2, (0.0, 0.0, 0.0, self.bar_opacity))
+                else:
+                    self.draw_rectangle(x - outline_width, y_bottom, x + outline_width, y_top, (0.0, 0.0, 0.0, self.bar_opacity))
+            
+            # Draw main bar
+            if self.settings["ROUNDED_CAPS"]:
+                self.draw_rounded_rectangle(x - bar_width/2, y_bottom, x + bar_width/2, y_top, bar_width/4, color_with_opacity)
+            else:
+                self.draw_rectangle(x - bar_width/2, y_bottom, x + bar_width/2, y_top, color_with_opacity)
     
     def draw_rectangle(self, x1, y1, x2, y2, color):
         """Helper method to draw a filled rectangle"""
@@ -1157,6 +1134,88 @@ class GLVisualizer(QOpenGLWidget):
         glVertex2f(x2, y1)
         glVertex2f(x2, y2)
         glVertex2f(x1, y2)
+        glEnd()
+    
+    def draw_rounded_rectangle(self, x1, y1, x2, y2, radius, color):
+        """Helper method to draw a filled rectangle with rounded corners"""
+        glBegin(GL_TRIANGLES)
+        glColor4f(*color)
+        
+        # Draw main rectangle body (without corners)
+        # Top rectangle
+        glVertex2f(x1 + radius, y2)
+        glVertex2f(x2 - radius, y2)
+        glVertex2f(x1 + radius, y2 - radius)
+        
+        glVertex2f(x2 - radius, y2)
+        glVertex2f(x2 - radius, y2 - radius)
+        glVertex2f(x1 + radius, y2 - radius)
+        
+        # Bottom rectangle  
+        glVertex2f(x1 + radius, y1 + radius)
+        glVertex2f(x2 - radius, y1 + radius)
+        glVertex2f(x1 + radius, y1)
+        
+        glVertex2f(x2 - radius, y1 + radius)
+        glVertex2f(x2 - radius, y1)
+        glVertex2f(x1 + radius, y1)
+        
+        # Middle rectangle
+        glVertex2f(x1, y1 + radius)
+        glVertex2f(x2, y1 + radius)
+        glVertex2f(x1, y2 - radius)
+        
+        glVertex2f(x2, y1 + radius)
+        glVertex2f(x2, y2 - radius)
+        glVertex2f(x1, y2 - radius)
+        
+        glEnd()
+        
+        # Draw rounded corners using triangle fans
+        segments = 8
+        
+        # Top-left corner
+        glBegin(GL_TRIANGLE_FAN)
+        glColor4f(*color)
+        glVertex2f(x1 + radius, y2 - radius)  # Center
+        for i in range(segments + 1):
+            angle = np.pi + i * (np.pi / 2) / segments
+            px = (x1 + radius) + radius * np.cos(angle)
+            py = (y2 - radius) + radius * np.sin(angle)
+            glVertex2f(px, py)
+        glEnd()
+        
+        # Top-right corner
+        glBegin(GL_TRIANGLE_FAN)
+        glColor4f(*color)
+        glVertex2f(x2 - radius, y2 - radius)  # Center
+        for i in range(segments + 1):
+            angle = np.pi / 2 + i * (np.pi / 2) / segments
+            px = (x2 - radius) + radius * np.cos(angle)
+            py = (y2 - radius) + radius * np.sin(angle)
+            glVertex2f(px, py)
+        glEnd()
+        
+        # Bottom-right corner
+        glBegin(GL_TRIANGLE_FAN)
+        glColor4f(*color)
+        glVertex2f(x2 - radius, y1 + radius)  # Center
+        for i in range(segments + 1):
+            angle = i * (np.pi / 2) / segments
+            px = (x2 - radius) + radius * np.cos(angle)
+            py = (y1 + radius) + radius * np.sin(angle)
+            glVertex2f(px, py)
+        glEnd()
+        
+        # Bottom-left corner
+        glBegin(GL_TRIANGLE_FAN)
+        glColor4f(*color)
+        glVertex2f(x1 + radius, y1 + radius)  # Center
+        for i in range(segments + 1):
+            angle = 3 * np.pi / 2 + i * (np.pi / 2) / segments
+            px = (x1 + radius) + radius * np.cos(angle)
+            py = (y1 + radius) + radius * np.sin(angle)
+            glVertex2f(px, py)
         glEnd()
     
     def show_song(self, song):
@@ -1384,7 +1443,7 @@ class MainWindow(QtWidgets.QMainWindow):
         elif event.key() == QtCore.Qt.Key_Q:
             # Toggle square mode
             self.settings_manager.settings["SQUARE_MODE"] = not self.settings_manager.settings["SQUARE_MODE"]
-            mode_status = "SQUARE" if self.settings_manager.settings["SQUARE_MODE"] else "CIRCULAR"
+            mode_status = "LINEAR" if self.settings_manager.settings["SQUARE_MODE"] else "CIRCULAR"
             logger.settings(f"Display mode: {mode_status}")
             self.settings_manager.save_settings_to_file(self.settings_manager.settings)
         elif event.key() == QtCore.Qt.Key_Plus or event.key() == QtCore.Qt.Key_Equal:
@@ -1581,7 +1640,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "T": "Increase UPDATE_INTERVAL (slower updates)",
             "G": "Decrease UPDATE_INTERVAL (faster updates)",
             "B": "Toggle BPM detection on/off",
-            "Q": "Toggle between circular and square display mode",
+            "Q": "Toggle between circular and linear bottom display mode",
             "+/=": "Increase HEIGHT_SENSITIVITY (bars require more volume)",
             "-": "Decrease HEIGHT_SENSITIVITY (bars require less volume)",
             "]": "Increase BAR_MAX_HEIGHT (maximum bar height)",
