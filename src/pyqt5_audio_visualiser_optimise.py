@@ -56,7 +56,7 @@ DEBUG = True
 
 logging.info("Sonic Halo: Real-Time Audio Visualizer by Dacus")
 # Major.Minor.Patch.Build
-VERSION = "0.9.1.1"
+VERSION = "0.9.2.1"
 logging.info(f"Version: {VERSION}")
 logging.info(f"System platform: {sys.platform}")
 
@@ -91,6 +91,11 @@ class SettingsManager:
             "USER_AUDIO_DEVICE": None,  # e.g. "CABLE Output (VB-Audio Virtual Cable)"
             "BPM_DETECTION_ENABLED": False,  # Toggle for BPM detection feature
             "USE_SYSTEM_AUDIO": True,  # Use WASAPI loopback to capture system audio output
+            "SQUARE_MODE": False,  # Toggle between circular and square display
+            "BAR_MAX_HEIGHT": 0.5,  # Maximum height bars can reach (0.1-1.0)
+            "HEIGHT_SENSITIVITY": 0.5,  # Multiplier for bar height sensitivity (0.1-5.0)
+            "BASE_ROTATION_SPEED": 0.001,  # Base rotation speed (constant rotation)
+            "AUDIO_ROTATION_SPEED": 0.8,  # Audio reactive rotation speed multiplier
             }
         self.default_settings = self.settings.copy()
 
@@ -367,7 +372,11 @@ class AudioProcessor:
         self.max_seen = max(self.max_seen, self.settings["MIN_MAX_SEEN"])
         self.min_seen = np.min(amps)
 
+        # Apply height sensitivity and max height controls
         amps = np.clip(amps / self.max_seen, 0, 1)
+        amps = amps * self.settings["HEIGHT_SENSITIVITY"]
+        amps = np.clip(amps, 0, self.settings["BAR_MAX_HEIGHT"])
+        
         vocal_indices = np.where((band_centers >= self.settings["VOCAL_MIN"]) & (band_centers <= self.settings["VOCAL_MAX"]))[0]
 
         if len(vocal_indices) and np.max(amps[vocal_indices]) > 0.1:
@@ -681,18 +690,27 @@ class GLVisualizer(QOpenGLWidget):
 
         amps = self.processor.smoothed_amps
 
-        min_radius = 0.175 # 0.22
-        outer_radius = min_radius+(self.processor.max_seen / 300) * (0.5 - min_radius)
-        inner_radius = outer_radius - 0.02 # min_radius+(self.processor.max_seen / 300) * (0.5 - min_radius)
-        performance_offset = 0 # min(delta - 16, 0)
-        self.arc_point_count = max(self.settings["ARC_POINT_COUNT"] - performance_offset, 2)
-        ring_bar_count = self.settings["ARC_POINT_COUNT"] * 2 # (BAR_COUNT * 2) - performance_offset
-        if self.settings["OUTLINE_SCALE"] > 0.1:
-            self.draw_ring(inner_radius-self.settings["OUTLINE_SCALE"]*0.01, outer_radius+0.03+self.settings["OUTLINE_SCALE"]*0.01, ring_bar_count, amps, outline=True)
-        self.draw_ring(inner_radius, outer_radius+0.03, ring_bar_count, amps)
+        # Choose display mode based on SQUARE_MODE setting
+        if self.settings["SQUARE_MODE"]:
+            self.draw_square_bars(amps, paint_bar_count)
+            ring_bar_count = paint_bar_count  # Use same count for BPM indicator
+        else:
+            # Original circular display
+            min_radius = 0.175 # 0.22
+            outer_radius = min_radius+(self.processor.max_seen / 300) * (0.5 - min_radius)
+            inner_radius = outer_radius - 0.02 # min_radius+(self.processor.max_seen / 300) * (0.5 - min_radius)
+            performance_offset = 0 # min(delta - 16, 0)
+            self.arc_point_count = max(self.settings["ARC_POINT_COUNT"] - performance_offset, 2)
+            ring_bar_count = self.settings["ARC_POINT_COUNT"] * 2 # (BAR_COUNT * 2) - performance_offset
+            if self.settings["OUTLINE_SCALE"] > 0.1:
+                self.draw_ring(inner_radius-self.settings["OUTLINE_SCALE"]*0.01, outer_radius+0.03+self.settings["OUTLINE_SCALE"]*0.01, ring_bar_count, amps, outline=True)
+            self.draw_ring(inner_radius, outer_radius+0.03, ring_bar_count, amps)
 
         bass_energy = np.prod(amps[:min(4, paint_bar_count)])
-        self.rotation_offset += 0.003 + self.processor.error/40000 + min(bass_energy * 0.1, 0.01)
+        # Calculate rotation with configurable speeds
+        base_rotation = self.settings["BASE_ROTATION_SPEED"]
+        audio_reactive_rotation = (self.processor.error/40000 + min(bass_energy * 0.1, 0.01)) * self.settings["AUDIO_ROTATION_SPEED"]
+        self.rotation_offset += base_rotation + audio_reactive_rotation
         self.rotation_offset %= 2 * np.pi
 
         min_value = np.max(amps)
@@ -703,28 +721,30 @@ class GLVisualizer(QOpenGLWidget):
             self.control, self.error, self.integral = pid_controller(peak_index, self.peak_pid, proportional, 0.0, 0.02, self.error, self.integral, delta/1000)
             self.peak_pid += self.control * delta/1000 # max_fft
 
-        for i in range(self.animated_bar_count):
-            shifted_index = (i + (self.rotation_offset * paint_bar_count / (2 * np.pi))) % paint_bar_count
+        # Draw bars for circular mode or handle rotation for square mode
+        if not self.settings["SQUARE_MODE"]:
+            for i in range(self.animated_bar_count):
+                shifted_index = (i + (self.rotation_offset * paint_bar_count / (2 * np.pi))) % paint_bar_count
 
-            idx0 = int(np.floor(shifted_index))
-            idx1 = (idx0 + 1) % paint_bar_count
-            frac = shifted_index - idx0
-            value = np.interp(frac, [0, 1], [amps[idx0], amps[idx1]]) * 1.00
-            value = max(value, self.settings["MIN_BAR_HEIGHT"])
-            min_value = max(value, min_value)
-            angle = (2 * np.pi * i) / paint_bar_count + 1.5 * np.pi + self.rotation_offset
+                idx0 = int(np.floor(shifted_index))
+                idx1 = (idx0 + 1) % paint_bar_count
+                frac = shifted_index - idx0
+                value = np.interp(frac, [0, 1], [amps[idx0], amps[idx1]]) * 1.00
+                value = max(value, self.settings["MIN_BAR_HEIGHT"])
+                min_value = max(value, min_value)
+                angle = (2 * np.pi * i) / paint_bar_count + 1.5 * np.pi + self.rotation_offset
 
-            r, g, b = self.interpolate_hsv_3stop(value, self.settings["LOW_COLOUR"], self.settings["MID_COLOUR"], self.settings["HIGH_COLOUR"], self.hsv_to_rgb)
-            if peak_index and self.processor.is_harmonic:
-                blue_offset = 0
-                if abs(shifted_index - self.peak_pid) < 2:
-                    blue_offset = (2 - abs(shifted_index - self.peak_pid)) / 3
-                #blue_offset = max(0,((abs(shifted_index - peak_index)/BAR_COUNT*2)))
-                b += blue_offset
-            if self.settings["OUTLINE_SCALE"] > 0.1:
-                self.draw_rounded_polys(angle, value, (0.0, 0.0, 0.0, self.bar_opacity), (self.settings["BAR_THICKNESS"] / 2) + self.settings["OUTLINE_SCALE"] * 0.01)
-            self.draw_rounded_polys(angle, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity), self.settings["BAR_THICKNESS"] / 2)
-            #self.draw_bar(angle, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity))
+                r, g, b = self.interpolate_hsv_3stop(value, self.settings["LOW_COLOUR"], self.settings["MID_COLOUR"], self.settings["HIGH_COLOUR"], self.hsv_to_rgb)
+                if peak_index and self.processor.is_harmonic:
+                    blue_offset = 0
+                    if abs(shifted_index - self.peak_pid) < 2:
+                        blue_offset = (2 - abs(shifted_index - self.peak_pid)) / 3
+                    #blue_offset = max(0,((abs(shifted_index - peak_index)/BAR_COUNT*2)))
+                    b += blue_offset
+                if self.settings["OUTLINE_SCALE"] > 0.1:
+                    self.draw_rounded_polys(angle, value, (0.0, 0.0, 0.0, self.bar_opacity), (self.settings["BAR_THICKNESS"] / 2) + self.settings["OUTLINE_SCALE"] * 0.01)
+                self.draw_rounded_polys(angle, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity), self.settings["BAR_THICKNESS"] / 2)
+                #self.draw_bar(angle, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity))
         lowering = False
         #print(f"min_value: {min_value:.4f}, bar_opacity: {self.bar_opacity:.4f}, animated_bar_count: {self.animated_bar_count}/{paint_bar_count}    ", end="\r")
         if min_value > self.settings["MIN_BAR_HEIGHT"]:
@@ -746,7 +766,9 @@ class GLVisualizer(QOpenGLWidget):
                     self.bar_opacity = 0.0
             else:
                 pass
-        self.draw_bpm_indicator(ring_bar_count)
+        # Draw BPM indicator (adjust count based on mode)
+        bpm_indicator_count = paint_bar_count if self.settings["SQUARE_MODE"] else ring_bar_count
+        self.draw_bpm_indicator(bpm_indicator_count)
         if not lowering or np.min(amps) > self.settings["MIN_BAR_HEIGHT"] / 10:
             if self.animated_bar_count < paint_bar_count:
                 self.animation_counter += 1
@@ -1052,6 +1074,91 @@ class GLVisualizer(QOpenGLWidget):
 
         return hsv_to_rgb(*hsv)
     
+    def draw_square_bars(self, amps, bar_count):
+        """Draw bars in a square formation around the window edges"""
+        bars_per_side = bar_count // 4
+        remainder = bar_count % 4
+        
+        # Calculate how many bars on each side (distribute remainder)
+        sides = [bars_per_side] * 4
+        for i in range(remainder):
+            sides[i] += 1
+        
+        bar_index = 0
+        
+        # Define the four sides: top, right, bottom, left
+        for side in range(4):
+            for i in range(sides[side]):
+                if bar_index >= self.animated_bar_count:
+                    break
+                    
+                # Calculate position along the side (0 to 1)
+                t = i / max(1, sides[side] - 1) if sides[side] > 1 else 0.5
+                
+                # Get amplitude value with rotation offset
+                shifted_index = (bar_index + (self.rotation_offset * bar_count / (2 * np.pi))) % bar_count
+                idx0 = int(np.floor(shifted_index))
+                idx1 = (idx0 + 1) % bar_count
+                frac = shifted_index - idx0
+                value = np.interp(frac, [0, 1], [amps[idx0], amps[idx1]])
+                value = max(value, self.settings["MIN_BAR_HEIGHT"])
+                
+                # Calculate colors
+                r, g, b = self.interpolate_hsv_3stop(value, self.settings["LOW_COLOUR"], 
+                                                   self.settings["MID_COLOUR"], self.settings["HIGH_COLOUR"], self.hsv_to_rgb)
+                
+                # Draw bar based on which side we're on
+                self.draw_square_bar(side, t, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity))
+                
+                bar_index += 1
+                
+            if bar_index >= self.animated_bar_count:
+                break
+    
+    def draw_square_bar(self, side, position, height, color):
+        """Draw a single bar on one of the four sides of the square"""
+        aspect = self.width() / self.height() if self.height() > 0 else 1.0
+        margin = 0.1  # Distance from edge
+        bar_width = 0.03  # Width of each bar
+        max_bar_length = 0.3  # Maximum length bars can extend inward
+        
+        # Scale height by max bar length
+        bar_length = height * max_bar_length
+        
+        if side == 0:  # Top side
+            x = -aspect + 2 * aspect * position
+            y1 = 1.0 - margin
+            y2 = y1 - bar_length
+            self.draw_rectangle(x - bar_width/2, y2, x + bar_width/2, y1, color)
+            
+        elif side == 1:  # Right side  
+            x1 = aspect - margin
+            x2 = x1 - bar_length
+            y = 1.0 - 2.0 * position
+            self.draw_rectangle(x2, y - bar_width/2, x1, y + bar_width/2, color)
+            
+        elif side == 2:  # Bottom side
+            x = aspect - 2 * aspect * position
+            y1 = -1.0 + margin
+            y2 = y1 + bar_length
+            self.draw_rectangle(x - bar_width/2, y1, x + bar_width/2, y2, color)
+            
+        elif side == 3:  # Left side
+            x1 = -aspect + margin
+            x2 = x1 + bar_length
+            y = -1.0 + 2.0 * position
+            self.draw_rectangle(x1, y - bar_width/2, x2, y + bar_width/2, color)
+    
+    def draw_rectangle(self, x1, y1, x2, y2, color):
+        """Helper method to draw a filled rectangle"""
+        glBegin(GL_QUADS)
+        glColor4f(*color)
+        glVertex2f(x1, y1)
+        glVertex2f(x2, y1)
+        glVertex2f(x2, y2)
+        glVertex2f(x1, y2)
+        glEnd()
+    
     def show_song(self, song):
         # Truncate if too long
         max_chars = 48  # or base on widget width
@@ -1274,6 +1381,52 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 logger.setLevel(logging.INFO)
                 logger.info("Logging level set to INFO (settings logs disabled)")
+        elif event.key() == QtCore.Qt.Key_Q:
+            # Toggle square mode
+            self.settings_manager.settings["SQUARE_MODE"] = not self.settings_manager.settings["SQUARE_MODE"]
+            mode_status = "SQUARE" if self.settings_manager.settings["SQUARE_MODE"] else "CIRCULAR"
+            logger.settings(f"Display mode: {mode_status}")
+            self.settings_manager.save_settings_to_file(self.settings_manager.settings)
+        elif event.key() == QtCore.Qt.Key_Plus or event.key() == QtCore.Qt.Key_Equal:
+            # Increase height sensitivity
+            if self.settings_manager.settings["HEIGHT_SENSITIVITY"] < 5.0:
+                self.settings_manager.settings["HEIGHT_SENSITIVITY"] = round(self.settings_manager.settings["HEIGHT_SENSITIVITY"] + 0.1, 1)
+                logger.settings(f"Updated HEIGHT_SENSITIVITY: {self.settings_manager.settings['HEIGHT_SENSITIVITY']}")
+        elif event.key() == QtCore.Qt.Key_Minus:
+            # Decrease height sensitivity
+            if self.settings_manager.settings["HEIGHT_SENSITIVITY"] > 0.1:
+                self.settings_manager.settings["HEIGHT_SENSITIVITY"] = round(self.settings_manager.settings["HEIGHT_SENSITIVITY"] - 0.1, 1)
+                logger.settings(f"Updated HEIGHT_SENSITIVITY: {self.settings_manager.settings['HEIGHT_SENSITIVITY']}")
+        elif event.key() == QtCore.Qt.Key_BracketRight:
+            # Increase max bar height
+            if self.settings_manager.settings["BAR_MAX_HEIGHT"] < 1.0:
+                self.settings_manager.settings["BAR_MAX_HEIGHT"] = round(self.settings_manager.settings["BAR_MAX_HEIGHT"] + 0.05, 2)
+                logger.settings(f"Updated BAR_MAX_HEIGHT: {self.settings_manager.settings['BAR_MAX_HEIGHT']}")
+        elif event.key() == QtCore.Qt.Key_BracketLeft:
+            # Decrease max bar height
+            if self.settings_manager.settings["BAR_MAX_HEIGHT"] > 0.1:
+                self.settings_manager.settings["BAR_MAX_HEIGHT"] = round(self.settings_manager.settings["BAR_MAX_HEIGHT"] - 0.05, 2)
+                logger.settings(f"Updated BAR_MAX_HEIGHT: {self.settings_manager.settings['BAR_MAX_HEIGHT']}")
+        elif event.key() == QtCore.Qt.Key_Comma:
+            # Decrease base rotation speed
+            if self.settings_manager.settings["BASE_ROTATION_SPEED"] > 0.0:
+                self.settings_manager.settings["BASE_ROTATION_SPEED"] = round(max(0.0, self.settings_manager.settings["BASE_ROTATION_SPEED"] - 0.001), 4)
+                logger.settings(f"Updated BASE_ROTATION_SPEED: {self.settings_manager.settings['BASE_ROTATION_SPEED']}")
+        elif event.key() == QtCore.Qt.Key_Period:
+            # Increase base rotation speed
+            if self.settings_manager.settings["BASE_ROTATION_SPEED"] < 0.1:
+                self.settings_manager.settings["BASE_ROTATION_SPEED"] = round(self.settings_manager.settings["BASE_ROTATION_SPEED"] + 0.001, 4)
+                logger.settings(f"Updated BASE_ROTATION_SPEED: {self.settings_manager.settings['BASE_ROTATION_SPEED']}")
+        elif event.key() == QtCore.Qt.Key_Semicolon:
+            # Decrease audio reactive rotation speed
+            if self.settings_manager.settings["AUDIO_ROTATION_SPEED"] > 0.0:
+                self.settings_manager.settings["AUDIO_ROTATION_SPEED"] = round(max(0.0, self.settings_manager.settings["AUDIO_ROTATION_SPEED"] - 0.1), 1)
+                logger.settings(f"Updated AUDIO_ROTATION_SPEED: {self.settings_manager.settings['AUDIO_ROTATION_SPEED']}")
+        elif event.key() == QtCore.Qt.Key_Apostrophe:
+            # Increase audio reactive rotation speed
+            if self.settings_manager.settings["AUDIO_ROTATION_SPEED"] < 5.0:
+                self.settings_manager.settings["AUDIO_ROTATION_SPEED"] = round(self.settings_manager.settings["AUDIO_ROTATION_SPEED"] + 0.1, 1)
+                logger.settings(f"Updated AUDIO_ROTATION_SPEED: {self.settings_manager.settings['AUDIO_ROTATION_SPEED']}")
 
     def update_bpm_display(self):
         """Update the BPM label display"""
@@ -1427,7 +1580,16 @@ class MainWindow(QtWidgets.QMainWindow):
             "F12": "Save current frame as PNG",
             "T": "Increase UPDATE_INTERVAL (slower updates)",
             "G": "Decrease UPDATE_INTERVAL (faster updates)",
-            "B": "Toggle BPM detection on/off"
+            "B": "Toggle BPM detection on/off",
+            "Q": "Toggle between circular and square display mode",
+            "+/=": "Increase HEIGHT_SENSITIVITY (bars require more volume)",
+            "-": "Decrease HEIGHT_SENSITIVITY (bars require less volume)",
+            "]": "Increase BAR_MAX_HEIGHT (maximum bar height)",
+            "[": "Decrease BAR_MAX_HEIGHT (maximum bar height)",
+            ",": "Decrease BASE_ROTATION_SPEED (constant rotation)",
+            ".": "Increase BASE_ROTATION_SPEED (constant rotation)",
+            ";": "Decrease AUDIO_ROTATION_SPEED (audio reactive rotation)",
+            "'": "Increase AUDIO_ROTATION_SPEED (audio reactive rotation)"
         }
         logging.info("Keybinds:")
         for key, desc in keybinds.items():
