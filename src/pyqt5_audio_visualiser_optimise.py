@@ -2,6 +2,14 @@
 import sys
 import numpy as np
 import sounddevice as sd
+# Add PyAudioWPatch for WASAPI loopback support
+try:
+    import pyaudiowpatch as pyaudio
+    WASAPI_AVAILABLE = True
+except ImportError:
+    WASAPI_AVAILABLE = False
+    import pyaudio
+    
 from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtWidgets import QOpenGLWidget
 from OpenGL.GL import *
@@ -82,6 +90,7 @@ class SettingsManager:
             "HIGH_COLOUR": (0.99, 0.81, 0.63),
             "USER_AUDIO_DEVICE": None,  # e.g. "CABLE Output (VB-Audio Virtual Cable)"
             "BPM_DETECTION_ENABLED": False,  # Toggle for BPM detection feature
+            "USE_SYSTEM_AUDIO": True,  # Use WASAPI loopback to capture system audio output
             }
         self.default_settings = self.settings.copy()
 
@@ -223,7 +232,14 @@ class AudioProcessor:
         self.amps = np.zeros(self.init_bar_count)
         self.smoothed_amps = np.zeros(self.init_bar_count)
         self.fall_velocity = np.zeros(self.init_bar_count)
-        self.device_index = self.find_device()
+        
+        # Initialize audio capture based on settings
+        if self.settings.get("USE_SYSTEM_AUDIO", False):
+            self.device_index, self.use_wasapi = self.find_wasapi_loopback_device()
+        else:
+            self.device_index = self.find_device()
+            self.use_wasapi = False
+            
         self.max_seen = 10.0
         self.highlighted_idx = None
         self.highlighted_freq = []
@@ -235,6 +251,59 @@ class AudioProcessor:
         self.bpm_peak_direction = 0
         self.bpm_timestamps = []
         self.bpm = 0.0
+        
+        # PyAudio stream for WASAPI loopback
+        self.pyaudio_instance = None
+        self.pyaudio_stream = None
+
+    def find_wasapi_loopback_device(self):
+        """Find WASAPI loopback device for system audio capture"""
+        if not WASAPI_AVAILABLE:
+            logging.warning("PyAudioWPatch not available. Falling back to regular microphone input.")
+            return self.find_device(), False
+            
+        try:
+            p = pyaudio.PyAudio()
+            
+            # Try to get default WASAPI loopback device
+            try:
+                wasapi_info = p.get_default_wasapi_loopback()
+                if wasapi_info:
+                    logging.info(f"Found WASAPI loopback device: {wasapi_info['name']}")
+                    p.terminate()
+                    return wasapi_info['index'], True
+            except:
+                pass
+                
+            # Fallback: look for loopback devices manually
+            logging.info("Searching for WASAPI loopback devices...")
+            for i in range(p.get_device_count()):
+                info = p.get_device_info_by_index(i)
+                if (info['maxInputChannels'] > 0 and 
+                    "loopback" in info['name'].lower()):
+                    logging.info(f"Found loopback device: {info['name']}")
+                    p.terminate()
+                    return i, True
+                    
+            # Try output devices for loopback
+            for i in range(p.get_device_count()):
+                info = p.get_device_info_by_index(i)
+                if (info['maxOutputChannels'] > 0 and 
+                    'wasapi' in info['name'].lower() and
+                    ('speakers' in info['name'].lower() or 
+                     'headphones' in info['name'].lower() or
+                     'audio' in info['name'].lower())):
+                    logging.info(f"Trying output device for loopback: {info['name']}")
+                    p.terminate()
+                    return i, True
+                    
+            p.terminate()
+            logging.warning("No WASAPI loopback device found. Falling back to regular input.")
+            return self.find_device(), False
+            
+        except Exception as e:
+            logging.error(f"Error finding WASAPI device: {e}")
+            return self.find_device(), False
 
     def find_device(self):
         logging.info("Attempting to find audio input device, use settings USER_AUDIO_DEVICE to specify")
@@ -255,7 +324,19 @@ class AudioProcessor:
         return None
 
     def analyze_chunk(self, indata, frames, time_info, status):
-        mono = np.mean(indata, axis=1)
+        # Handle different input formats based on audio source
+        if self.use_wasapi and isinstance(indata, bytes):
+            # PyAudio WASAPI returns bytes, convert to numpy array
+            samples = np.frombuffer(indata, dtype=np.int16).astype(np.float32) / 32768.0
+            # Reshape to stereo if needed
+            if len(samples) % 2 == 0:
+                mono = np.mean(samples.reshape(-1, 2), axis=1)
+            else:
+                mono = samples
+        else:
+            # SoundDevice returns numpy array directly
+            mono = np.mean(indata, axis=1) if len(indata.shape) > 1 else indata
+            
         N = 4096 * 2
         fft = np.abs(np.fft.rfft(mono, n=N))
         freqs = np.fft.rfftfreq(N, d=1 / self.settings["SAMPLE_RATE"])
@@ -1043,13 +1124,60 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.move(self.settings_manager.settings["WINDOW_POS_X"], self.settings_manager.settings["WINDOW_POS_Y"])
 
+        # Initialize audio stream based on processor settings
+        self.initialize_audio_stream()
 
+    def initialize_audio_stream(self):
+        """Initialize audio stream - either WASAPI loopback or regular input"""
+        if self.processor.use_wasapi:
+            self.setup_wasapi_stream()
+        else:
+            self.setup_sounddevice_stream()
+
+    def setup_wasapi_stream(self):
+        """Setup WASAPI loopback stream using PyAudio"""
+        try:
+            self.processor.pyaudio_instance = pyaudio.PyAudio()
+            
+            device_info = self.processor.pyaudio_instance.get_device_info_by_index(self.processor.device_index)
+            sample_rate = int(device_info['defaultSampleRate'])
+            channels = device_info['maxInputChannels'] if device_info['maxInputChannels'] > 0 else 2
+            
+            logging.info(f"Setting up WASAPI stream: {device_info['name']}")
+            logging.info(f"Sample rate: {sample_rate}, Channels: {channels}")
+            
+            def pyaudio_callback(in_data, frame_count, time_info, status):
+                self.processor.analyze_chunk(in_data, frame_count, time_info, status)
+                return (None, pyaudio.paContinue)
+            
+            self.processor.pyaudio_stream = self.processor.pyaudio_instance.open(
+                format=pyaudio.paInt16,
+                channels=channels,
+                rate=sample_rate,
+                input=True,
+                input_device_index=self.processor.device_index,
+                frames_per_buffer=self.settings_manager.settings["CHUNK"],
+                stream_callback=pyaudio_callback
+            )
+            
+            self.processor.pyaudio_stream.start_stream()
+            logging.info("WASAPI loopback stream started successfully")
+            
+        except Exception as e:
+            logging.error(f"Failed to setup WASAPI stream: {e}")
+            logging.info("Falling back to SoundDevice input stream")
+            self.processor.use_wasapi = False
+            self.setup_sounddevice_stream()
+
+    def setup_sounddevice_stream(self):
+        """Setup regular SoundDevice input stream"""
         self.stream = sd.InputStream(device=self.processor.device_index,
                        channels=2,
                        samplerate=self.settings_manager.settings["SAMPLE_RATE"],
                        blocksize=self.settings_manager.settings["CHUNK"],
                        callback=self.processor.analyze_chunk)
         self.stream.start()
+        logging.info("SoundDevice input stream started")
 
     def keyPressEvent(self, event):
         if event.key() == QtCore.Qt.Key_P:
@@ -1161,7 +1289,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def display_mode(self):
         pos = self.pos()
         self.visualizer.pause_rendering()
-        self.stream.stop()
+        self.close_audio_streams()
         #time.sleep(0.5)
 
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
@@ -1176,13 +1304,12 @@ class MainWindow(QtWidgets.QMainWindow):
         #QtCore.QTimer.singleShot(500, lambda: self.visualizer.resume_rendering())
         make_window_clickthrough(self)
         self.visualizer.resume_rendering()
-        self.stream.start()
-
+        self.start_audio_streams()
 
     def window_mode(self):
         pos = self.pos()
         self.visualizer.pause_rendering()
-        self.stream.stop()
+        self.close_audio_streams()
         #time.sleep(0.5)
 
         self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.WindowStaysOnTopHint)
@@ -1197,7 +1324,39 @@ class MainWindow(QtWidgets.QMainWindow):
         #QtCore.QTimer.singleShot(500, lambda: self.visualizer.resume_rendering())
         make_window_clickable(self)
         self.visualizer.resume_rendering()
-        self.stream.start()
+        self.start_audio_streams()
+
+    def start_audio_streams(self):
+        """Start audio streams properly based on type"""
+        try:
+            if self.processor.use_wasapi:
+                # For WASAPI, we need to check if stream is closed and reinitialize if needed
+                if (self.processor.pyaudio_stream is None or 
+                    not self.processor.pyaudio_stream.is_active()):
+                    logging.info("Reinitializing WASAPI stream")
+                    self.setup_wasapi_stream()
+                else:
+                    self.processor.pyaudio_stream.start_stream()
+                    logging.info("WASAPI stream started")
+            else:
+                if hasattr(self, 'stream'):
+                    if self.stream.closed:
+                        logging.info("Reinitializing SoundDevice stream")
+                        self.setup_sounddevice_stream()
+                    else:
+                        self.stream.start()
+                        logging.info("SoundDevice stream started")
+                else:
+                    logging.info("Initializing SoundDevice stream")
+                    self.setup_sounddevice_stream()
+        except Exception as e:
+            logging.error(f"Error starting audio streams: {e}")
+            # Try to reinitialize the stream
+            try:
+                logging.info("Attempting to reinitialize audio stream")
+                self.initialize_audio_stream()
+            except Exception as e2:
+                logging.error(f"Failed to reinitialize audio stream: {e2}")
 
 
     def centered_setText(self, text):
@@ -1220,13 +1379,35 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.windowFlags() & QtCore.Qt.FramelessWindowHint:
             self.window_mode()
         self.visualizer.pause_rendering()
-        self.stream.stop()
+        
+        # Fully close audio streams on app exit
+        self.close_audio_streams()
+        
         self.settings_manager.settings["WINDOW_POS_X"] = self.x()
         self.settings_manager.settings["WINDOW_POS_Y"] = self.y()
         self.settings_manager.settings["WINDOW_WIDTH"] = self.width()
         self.settings_manager.settings["WINDOW_HEIGHT"] = self.height()
         self.settings_manager.save_settings_to_file(self.settings_manager.settings)
         event.accept()
+
+    def close_audio_streams(self):
+        """Fully close and cleanup audio streams on app exit"""
+        try:
+            if self.processor.use_wasapi:
+                if self.processor.pyaudio_stream:
+                    if self.processor.pyaudio_stream.is_active():
+                        self.processor.pyaudio_stream.stop_stream()
+                    self.processor.pyaudio_stream.close()
+                if self.processor.pyaudio_instance:
+                    self.processor.pyaudio_instance.terminate()
+                logging.info("WASAPI streams closed")
+            else:
+                if hasattr(self, 'stream') and not self.stream.closed:
+                    self.stream.stop()
+                    self.stream.close()
+                logging.info("SoundDevice stream closed")
+        except Exception as e:
+            logging.error(f"Error closing audio streams: {e}")
     
     def log_keybinds():
         keybinds = {
