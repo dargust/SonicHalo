@@ -56,7 +56,7 @@ DEBUG = True
 
 logging.info("Sonic Halo: Real-Time Audio Visualizer by Dacus")
 # Major.Minor.Patch.Build
-VERSION = "0.8.2.2"
+VERSION = "0.9.1.1"
 logging.info(f"Version: {VERSION}")
 logging.info(f"System platform: {sys.platform}")
 
