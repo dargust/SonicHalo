@@ -1,4 +1,3 @@
-glcontext
 numpy
 PyOpenGL
 PyQt5
@@ -6,3 +5,4 @@ PyQt5-Qt5
 PyQt5_sip
 sounddevice
 winsdk
+PyAudio
