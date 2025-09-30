@@ -17,6 +17,7 @@ import ctypes, logging, json, os
 import platformdirs.windows
 import time
 import asyncio
+from winnotifyicon import TaskbarIcon
 
 
 # --- Custom logging level for SETTINGS ---
@@ -374,7 +375,7 @@ class AudioProcessor:
 
         # Apply height sensitivity and max height controls
         amps = np.clip(amps / self.max_seen, 0, 1)
-        # Apply sensitivity scaling, linear for high, exponential for low
+        # Apply sensitivity scaling, the higher the amps the harder it is to increase
         amps = amps * self.settings["HEIGHT_SENSITIVITY"] if self.settings["HEIGHT_SENSITIVITY"] >= 1.0 else amps ** (2.0 - self.settings["HEIGHT_SENSITIVITY"])
         amps = np.clip(amps, 0, self.settings["BAR_MAX_HEIGHT"])
         
@@ -704,8 +705,8 @@ class GLVisualizer(QOpenGLWidget):
             self.arc_point_count = max(self.settings["ARC_POINT_COUNT"] - performance_offset, 2)
             ring_bar_count = self.settings["ARC_POINT_COUNT"] * 2 # (BAR_COUNT * 2) - performance_offset
             if self.settings["OUTLINE_SCALE"] > 0.1:
-                self.draw_ring(inner_radius-self.settings["OUTLINE_SCALE"]*0.01, outer_radius+0.03+self.settings["OUTLINE_SCALE"]*0.01, ring_bar_count, amps, outline=True)
-            self.draw_ring(inner_radius, outer_radius+0.03, ring_bar_count, amps)
+                self.draw_ring(inner_radius-self.settings["OUTLINE_SCALE"]*0.01, outer_radius+0.03+self.settings["OUTLINE_SCALE"]*0.01, ring_bar_count*2, amps, outline=True)
+            self.draw_ring(inner_radius, outer_radius+0.03, ring_bar_count*2, amps)
 
         bass_energy = np.prod(amps[:min(4, paint_bar_count)])
         # Calculate rotation with configurable speeds
@@ -772,7 +773,7 @@ class GLVisualizer(QOpenGLWidget):
             else:
                 pass
         # Draw BPM indicator (adjust count based on mode)
-        bpm_indicator_count = paint_bar_count if self.settings["SQUARE_MODE"] else ring_bar_count
+        bpm_indicator_count = paint_bar_count if self.settings["SQUARE_MODE"] else ring_bar_count * 2
         self.draw_bpm_indicator(bpm_indicator_count)
         if not lowering or np.min(amps) > self.settings["MIN_BAR_HEIGHT"] / 10:
             if self.animated_bar_count < paint_bar_count:
@@ -800,9 +801,18 @@ class GLVisualizer(QOpenGLWidget):
             alpha = 255
             if self.song_fade_step > 0:
                 alpha = int(255 * (1 - self.song_fade_step / self.song_fade_steps))
+            rect = self.rect()
+            # Draw black outline by drawing text multiple times with offset
+            outline_color = QtGui.QColor(0, 0, 0, alpha)
+            for dx in [-2, -1, 0, 1, 2]:
+                for dy in [-2, -1, 0, 1, 2]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    painter.setPen(outline_color)
+                    painter.drawText(rect.translated(dx, dy), QtCore.Qt.AlignCenter, self.current_song)
+            # Draw main text in white
             color = QtGui.QColor(255, 255, 255, alpha)
             painter.setPen(color)
-            rect = self.rect()
             painter.drawText(rect, QtCore.Qt.AlignCenter, self.current_song)
             painter.end()
     
@@ -1082,7 +1092,7 @@ class GLVisualizer(QOpenGLWidget):
     def draw_linear_bars(self, amps, bar_count):
         """Draw bars in a line across the bottom of the window"""
         aspect = self.width() / self.height() if self.height() > 0 else 1.0
-        margin = 0.1  # Distance from bottom edge
+        margin = 0.02  # Distance from bottom edge
         bar_spacing = (2 * aspect) / bar_count  # Total width divided by number of bars
         bar_width = bar_spacing * 0.8  # Leave some space between bars
         max_bar_height = 0.6  # Maximum height bars can reach
@@ -1105,7 +1115,7 @@ class GLVisualizer(QOpenGLWidget):
             
             # Calculate bar position and dimensions
             x = start_x + i * bar_spacing
-            bar_height = value * max_bar_height
+            bar_height = value * max_bar_height * 2
             y_bottom = -1.0 + margin
             y_top = y_bottom + bar_height
             
@@ -1273,7 +1283,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bpm_label.setGeometry(10, 10, 100, 30)
         self.bpm_label.setText("BPM: --")
         self.bpm_label.show()
-        
+
+        icon_path = resource_path(r"media/sonic_halo_2.ico")
+        self.tray_icon = TaskbarIcon(icon_path, {"Window mode": self.window_mode, "Display mode": self.display_mode, "Quit": self.close}, "Sonic Halo", left_click_callback=self.window_mode)
+
         # Timer for updating BPM display
         self.bpm_update_timer = QtCore.QTimer()
         self.bpm_update_timer.timeout.connect(self.update_bpm_display)

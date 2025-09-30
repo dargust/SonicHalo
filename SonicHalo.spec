@@ -5,7 +5,7 @@ a = Analysis(
     ['src\\pyqt5_audio_visualiser_optimise.py'],
     pathex=[],
     binaries=[],
-    datas=[('.\\media\\Px437_IBM_VGA_8x14.ttf', 'media')],
+    datas=[('.\\media\\Px437_IBM_VGA_8x14.ttf', 'media'), ('.\\media\\sonic_halo_2.ico', 'media')],
     hiddenimports=['winsdk.windows.media.control', 'winsdk.windows.media', 'winsdk.windows'],
     hookspath=[],
     hooksconfig={},
