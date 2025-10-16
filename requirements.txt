@@ -4,5 +4,17 @@ PyQt5
 PyQt5-Qt5
 PyQt5_sip
 sounddevice
-winsdk
-PyAudio
+
+# Windows-specific dependencies (optional)
+winsdk; sys_platform == "win32"
+PyAudio; sys_platform == "win32"
+pyaudiowpatch; sys_platform == "win32"
+pywin32; sys_platform == "win32"
+
+# Linux-specific dependencies (optional)
+# PulseAudio development files may be needed for some audio functionality
+# Install with: sudo apt-get install pulseaudio-dev
+
+# macOS-specific dependencies (optional)
+# BlackHole or Soundflower for system audio capture
+# Install BlackHole from: https://github.com/ExistentialAudio/BlackHole

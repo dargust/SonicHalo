@@ -14,10 +14,9 @@ from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtWidgets import QOpenGLWidget
 from OpenGL.GL import *
 import ctypes, logging, json, os
-import platformdirs.windows
+import platformdirs
 import time
 import asyncio
-from winnotifyicon import TaskbarIcon
 
 
 # --- Custom logging level for SETTINGS ---
@@ -37,15 +36,37 @@ logger = logging.getLogger()
 
 ON_WINDOWS = sys.platform.startswith('win')
 ON_LINUX = sys.platform.startswith('linux')
+ON_MACOS = sys.platform.startswith('darwin')
 
+# Import platform-specific modules
 if ON_WINDOWS:
+    try:
+        from winnotifyicon import TaskbarIcon
+        TASKBAR_ICON_AVAILABLE = True
+    except ImportError:
+        TASKBAR_ICON_AVAILABLE = False
     try:
         from winsdk.windows.media.control import \
             GlobalSystemMediaTransportControlsSessionManager as MediaManager
     except ImportError:
         MediaManager = None
 else:
+    TASKBAR_ICON_AVAILABLE = False
     MediaManager = None
+
+# Try to import cross-platform tray icon
+try:
+    from cross_platform_tray import CrossPlatformTrayIcon
+    CROSS_PLATFORM_TRAY_AVAILABLE = True
+except ImportError:
+    CROSS_PLATFORM_TRAY_AVAILABLE = False
+
+# Try to import cross-platform audio utilities
+try:
+    from cross_platform_audio import get_system_audio_devices, setup_system_audio_capture
+    CROSS_PLATFORM_AUDIO_AVAILABLE = True
+except ImportError:
+    CROSS_PLATFORM_AUDIO_AVAILABLE = False
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -57,7 +78,7 @@ DEBUG = True
 
 logging.info("Sonic Halo: Real-Time Audio Visualizer by Dacus")
 # Major.Minor.Patch.Build
-VERSION = "0.9.3.1"
+VERSION = "0.10.1.3"
 logging.info(f"Version: {VERSION}")
 logging.info(f"System platform: {sys.platform}")
 
@@ -141,6 +162,11 @@ def get_weighted_band_edges(min_freq, max_freq, band_count, low_bias=2.5):
     return min_freq * (max_freq / min_freq) ** t_weighted
 
 def make_window_clickthrough(window):
+    """Make window clickthrough - Windows only for now"""
+    if not ON_WINDOWS:
+        logging.warning("Clickthrough windows not yet supported on this platform")
+        return
+        
     try:
         hwnd = int(window.winId())
         style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
@@ -151,6 +177,10 @@ def make_window_clickthrough(window):
 
 
 def make_window_clickable(window):
+    """Make window clickable - Windows only for now"""
+    if not ON_WINDOWS:
+        return
+        
     try:
         hwnd = int(window.winId())
         style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
@@ -223,12 +253,32 @@ class SongPoller(QtCore.QThread):
         return None
 
 class DevicesMap:
+    # Windows devices
     VIRTUAL_CABLE = "CABLE Output (VB-Audio Virtual Cable)"
     STEREO_MIX = "Stereo Mix"
-    device_priority = [STEREO_MIX, VIRTUAL_CABLE]
+    
+    # Linux devices (PulseAudio/ALSA)
+    PULSE_MONITOR = "Monitor"  # PulseAudio monitor devices
+    ALSA_LOOPBACK = "Loopback"  # ALSA loopback devices
+    
+    # macOS devices
+    SOUNDFLOWER = "Soundflower"
+    BLACKHOLE = "BlackHole"
+    
     def __init__(self, user_device=None):
         self.user_device = user_device
-        self.device_priority = [user_device] + self.device_priority if user_device else self.device_priority
+        
+        if ON_WINDOWS:
+            self.device_priority = [self.STEREO_MIX, self.VIRTUAL_CABLE]
+        elif ON_LINUX:
+            self.device_priority = [self.PULSE_MONITOR, self.ALSA_LOOPBACK]
+        elif ON_MACOS:
+            self.device_priority = [self.BLACKHOLE, self.SOUNDFLOWER]
+        else:
+            self.device_priority = []
+            
+        if user_device:
+            self.device_priority = [user_device] + self.device_priority
 
 class AudioProcessor:
     init_bar_count = 64 # settings["BAR_COUNT"]
@@ -314,19 +364,59 @@ class AudioProcessor:
     def find_device(self):
         logging.info("Attempting to find audio input device, use settings USER_AUDIO_DEVICE to specify")
         devices = sd.query_devices()
-        # Try priority devices first
         device_map = DevicesMap()
+        
+        # Try priority devices first
         for preferred in device_map.device_priority:
             for i, dev in enumerate(devices):
-                if preferred in dev['name'] and dev['max_input_channels'] > 0:
+                if preferred.lower() in dev['name'].lower() and dev['max_input_channels'] > 0:
                     logging.info(f"Using audio device: {dev['name']}")
                     return i
-        # Fallback: first device with input channels
-        #for i, dev in enumerate(devices):
-        #    if dev['max_input_channels'] > 0:
-        #        return i
+        
+        # Try cross-platform system audio devices
+        if CROSS_PLATFORM_AUDIO_AVAILABLE:
+            try:
+                system_devices = get_system_audio_devices()
+                for sys_dev in system_devices:
+                    for i, dev in enumerate(devices):
+                        if (sys_dev['name'].lower() in dev['name'].lower() or
+                            sys_dev['description'].lower() in dev['name'].lower()):
+                            logging.info(f"Using cross-platform system audio device: {dev['name']}")
+                            return i
+            except Exception as e:
+                logging.warning(f"Error getting cross-platform audio devices: {e}")
+        
+        # Platform-specific fallbacks
+        if ON_LINUX:
+            # Look for PulseAudio monitor devices
+            for i, dev in enumerate(devices):
+                if ('pulse' in dev['name'].lower() and 
+                    'monitor' in dev['name'].lower() and 
+                    dev['max_input_channels'] > 0):
+                    logging.info(f"Using PulseAudio monitor device: {dev['name']}")
+                    return i
+                # Also look for .monitor devices
+                if dev['name'].endswith('.monitor') and dev['max_input_channels'] > 0:
+                    logging.info(f"Using monitor device: {dev['name']}")
+                    return i
+        
+        elif ON_MACOS:
+            # Look for virtual audio devices
+            for i, dev in enumerate(devices):
+                if (('blackhole' in dev['name'].lower() or 
+                     'soundflower' in dev['name'].lower()) and 
+                    dev['max_input_channels'] > 0):
+                    logging.info(f"Using macOS virtual audio device: {dev['name']}")
+                    return i
+        
+        # General fallback: first device with input channels
+        for i, dev in enumerate(devices):
+            if dev['max_input_channels'] > 0:
+                logging.info(f"Using fallback audio device: {dev['name']}")
+                return i
 
-        # Fallback: return None
+        # Ultimate fallback: return None
+        logging.warning("No suitable audio input device found")
         return None
 
     def analyze_chunk(self, indata, frames, time_info, status):
@@ -1285,7 +1375,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bpm_label.show()
 
         icon_path = resource_path(r"media/sonic_halo_2.ico")
-        self.tray_icon = TaskbarIcon(icon_path, {"Window mode": self.window_mode, "Display mode": self.display_mode, "Quit": self.close}, "Sonic Halo", left_click_callback=self.window_mode)
+        
+        # Initialize taskbar icon with cross-platform support
+        if CROSS_PLATFORM_TRAY_AVAILABLE:
+            try:
+                self.tray_icon = CrossPlatformTrayIcon(
+                    icon_path, 
+                    {"Window mode": self.window_mode, "Display mode": self.display_mode, "Quit": self.close}, 
+                    "Sonic Halo", 
+                    left_click_callback=self.window_mode
+                )
+                if self.tray_icon.is_available():
+                    logging.info("Cross-platform tray icon initialized")
+                else:
+                    self.tray_icon = None
+                    logging.info("Tray icon not available on this system")
+            except Exception as e:
+                logging.warning(f"Failed to initialize cross-platform tray icon: {e}")
+                self.tray_icon = None
+        elif TASKBAR_ICON_AVAILABLE and ON_WINDOWS:
+            # Fallback to Windows-only tray icon
+            try:
+                self.tray_icon = TaskbarIcon(icon_path, {"Window mode": self.window_mode, "Display mode": self.display_mode, "Quit": self.close}, "Sonic Halo", left_click_callback=self.window_mode)
+                logging.info("Windows taskbar icon initialized")
+            except Exception as e:
+                logging.warning(f"Failed to initialize Windows taskbar icon: {e}")
+                self.tray_icon = None
+        else:
+            self.tray_icon = None
+            logging.info("No tray icon support available")
 
         # Timer for updating BPM display
         self.bpm_update_timer = QtCore.QTimer()
