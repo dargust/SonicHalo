@@ -118,6 +118,9 @@ class SettingsManager:
             "HEIGHT_SENSITIVITY": 0.5,  # Multiplier for bar height sensitivity (0.1-5.0)
             "BASE_ROTATION_SPEED": 0.001,  # Base rotation speed (constant rotation)
             "AUDIO_ROTATION_SPEED": 0.8,  # Audio reactive rotation speed multiplier
+            "BALL_ENABLED": True,  # Toggle physics ball on/off
+            "BALL_BOOM_ENABLED": True,  # Toggle "boom" impulse on volume spikes
+            "BALL_BOOM_THRESHOLD": 300,  # PID error threshold for boom effect
             }
         self.default_settings = self.settings.copy()
 
@@ -699,6 +702,197 @@ class AudioProcessor:
                 fall_amount = max(0.005, self.fall_velocity[i])
                 self.smoothed_amps[i] = max(0, self.smoothed_amps[i] - fall_amount)
 
+class Ball:
+    """Physics-based ball that bounces off bars and ring"""
+    def __init__(self):
+        self.pos = np.array([0.0, 0.0])  # x, y position
+        self.vel = np.array([np.random.uniform(-0.005, 0.005), 
+                            np.random.uniform(-0.005, 0.005)])  # Small initial velocity
+        self.radius = 0.020  # Ball radius in OpenGL coords (smaller for better fit)
+        self.gravity = -0.0005  # Gravity acceleration (negative = downward) - reduced for more float
+        self.bounce = 0.9  # Bounce coefficient (0-1, lower = less bouncy)
+        self.friction = 0.995  # Air friction per frame (higher = less friction) - increased to maintain momentum
+        self.mass = 1.0  # Ball mass for collision response
+        
+    def update(self, delta_ms, substeps=4):
+        """Update ball physics with substeps for better collision detection at high speeds
+        
+        Args:
+            delta_ms: Time elapsed since last frame in milliseconds
+            substeps: Number of physics substeps per frame (higher = more accurate, more expensive)
+        """
+        dt = delta_ms / 16.0  # Normalize to ~60fps
+        
+        # Divide the timestep into substeps for continuous collision detection
+        # This prevents fast-moving balls from tunneling through thin objects
+        sub_dt = dt / substeps
+        
+        for _ in range(substeps):
+            # Apply gravity
+            self.vel[1] += self.gravity * sub_dt
+            
+            # Apply friction
+            self.vel *= self.friction ** (1.0 / substeps)
+            
+            # Update position
+            self.pos += self.vel * sub_dt
+        
+    def collide_with_ring(self, inner_radius, outer_radius, amps, bar_count):
+        """Check and respond to collision with the dynamic audio-reactive ring
+        
+        The ring is not a perfect circle - it has wavy edges based on audio amplitudes.
+        We need to sample the ring's actual radius at the ball's angular position.
+        
+        Args:
+            inner_radius: Base inner radius of the ring
+            outer_radius: Base outer radius of the ring
+            amps: Array of amplitude values that modify the ring shape
+            bar_count: Number of bars (used for interpolation)
+        
+        Returns True if collision occurred
+        """
+        dist = np.linalg.norm(self.pos)
+        
+        if dist < 1e-6:
+            return False
+        
+        # Calculate ball's angle from center
+        ball_angle = np.arctan2(self.pos[0], self.pos[1])  # Note: using (x, y) not (y, x) to match draw_ring
+        
+        # Normalize angle to [0, 2π] and convert to ring coordinate system
+        # draw_ring uses: angle = -(2 * np.pi * i / segments) + np.pi
+        # We need to reverse this to find the right amplitude sample
+        normalized_angle = (-ball_angle + np.pi) % (2 * np.pi)
+        
+        # Calculate the fractional index into the amps array
+        # This matches: frac = (ring_bar_count / (segments + 1)) * i
+        # Solving for i: i = frac * (segments + 1) / ring_bar_count
+        # And: normalized_angle = 2 * pi * i / segments, so i = normalized_angle * segments / (2 * pi)
+        segments = len(amps) * 2  # Ring typically uses BAR_COUNT * 2 segments
+        i = normalized_angle * segments / (2 * np.pi)
+        frac = (bar_count / (segments + 1)) * i
+        
+        # Interpolate amplitude at ball's angular position (same as draw_ring)
+        l_interp = np.sqrt(np.interp(frac, np.arange(len(amps)), amps))
+        l_interp = max(l_interp, 0.0)  # Ensure non-negative
+        
+        # Calculate actual inner ring radius at this angle
+        actual_inner_radius = inner_radius + l_interp / 30
+        
+        # Check if ball hit the inner edge of the ring (from inside the center area)
+        if dist > actual_inner_radius - self.radius:
+            # Ball hit the ring from inside - push it back toward center
+            # Use radial normal (perpendicular to ring surface at this point)
+            normal = self.pos / dist  # Points outward from center
+            penetration = dist - (actual_inner_radius - self.radius)
+            
+            # Move ball back toward center
+            self.pos -= normal * penetration
+            
+            # Reflect velocity inward (away from ring)
+            vel_normal = np.dot(self.vel, normal)
+            if vel_normal > 0:  # Moving outward toward ring
+                self.vel -= normal * vel_normal * (1 + self.bounce)
+            return True
+            
+        return False
+    
+    def collide_with_bar(self, bar_base, bar_tip, bar_angle, bar_thickness, bar_velocity=0.0):
+        """Check and respond to collision with a rotating bar
+        
+        The ball is in the center and bars extend outward from center.
+        Ball should bounce off bars from the inside (center area).
+        
+        Args:
+            bar_base: Base radius of the bar (closer to center)
+            bar_tip: Tip radius of the bar (varies with audio, extends outward)
+            bar_angle: Current angle of the bar (radians)
+            bar_thickness: Thickness of the bar
+            bar_velocity: How fast the bar is extending/retracting (change in tip position)
+        """
+        # Convert bar to line segment in cartesian coords
+        bar_dir = np.array([np.sin(bar_angle), np.cos(bar_angle)])
+        bar_start = bar_dir * bar_base
+        bar_end = bar_dir * bar_tip
+        
+        # Find closest point on bar line segment to ball
+        bar_vec = bar_end - bar_start
+        bar_len_sq = np.dot(bar_vec, bar_vec)
+        
+        if bar_len_sq < 1e-6:
+            return False
+            
+        # t represents position along bar: 0 = base, 1 = tip
+        t = np.dot(self.pos - bar_start, bar_vec) / bar_len_sq
+        t_clamped = max(0, min(1, t))
+        closest_point = bar_start + t_clamped * bar_vec
+        
+        # Check distance to closest point
+        to_ball = self.pos - closest_point
+        dist = np.linalg.norm(to_ball)
+        collision_dist = self.radius + bar_thickness / 2
+        
+        if dist < collision_dist and dist > 1e-6:
+            # Collision detected
+            
+            # Determine collision normal based on WHERE we hit the bar
+            if t < 0 or t > 1:
+                # Hit the circular end caps (base or tip)
+                # Use radial direction from the end point
+                collision_normal = to_ball / dist
+            else:
+                # Hit the bar body (not the ends)
+                # Use perpendicular to bar to avoid bias
+                perp1 = np.array([-bar_dir[1], bar_dir[0]])  # 90° rotation
+                perp2 = np.array([bar_dir[1], -bar_dir[0]])   # -90° rotation
+                
+                # Choose the perpendicular that points toward the ball
+                if np.dot(perp1, to_ball) > 0:
+                    collision_normal = perp1
+                else:
+                    collision_normal = perp2
+            
+            # Normalize
+            collision_normal = collision_normal / (np.linalg.norm(collision_normal) + 1e-6)
+            
+            # Push ball away from bar along the collision normal
+            penetration = collision_dist - dist
+            self.pos += collision_normal * penetration * 1.2  # Extra push to prevent sticking
+            
+            # Calculate bar surface velocity from extension/retraction
+            # Bar extends radially outward along bar_dir
+            # Don't scale by t_clamped - entire bar moves when it extends!
+            bar_surface_velocity = bar_dir * bar_velocity * t_clamped
+            
+            # Reflect velocity along the collision normal
+            vel_along_normal = np.dot(self.vel, collision_normal)
+            
+            if vel_along_normal < 0:  # Only reflect if moving into the bar
+                # Standard reflection with bounce
+                self.vel = self.vel - collision_normal * vel_along_normal * (1 + self.bounce)
+            
+            # ALWAYS add bar's extension velocity (the "kick")
+            # This happens regardless of reflection
+            if bar_velocity > 0.001:  # Bar is extending (growing)
+                # Add the bar's velocity with strong transfer - this is the kick!
+                kick_velocity = bar_surface_velocity * 1.5  # Strong kick for satisfying feel
+                self.vel += kick_velocity
+            
+            # Add very small random noise to break perfect symmetries
+            self.vel += np.random.uniform(-0.0002, 0.0002, 2)
+            self.vel += np.random.uniform(-0.0002, 0.0002, 2)
+            
+            return True
+            
+        return False
+    
+    def respawn(self):
+        """Respawn ball at center if it escapes"""
+        self.pos = np.array([0.0, 0.0])
+        self.vel = np.array([np.random.uniform(-0.005, 0.005), 
+                            np.random.uniform(-0.005, 0.005)])
+
+
 class GLVisualizer(QOpenGLWidget):
     def __init__(self, processor, parent=None, settings=None):
         logging.info("Initialising Visualiser")
@@ -706,6 +900,8 @@ class GLVisualizer(QOpenGLWidget):
         self.settings = settings if settings else {}
         self.processor = processor
         self.rotation_offset = 0.0
+        self.ball = Ball()  # Initialize physics ball
+        self.previous_bar_values = np.zeros(64)  # Track previous bar heights for velocity calculation
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
         self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
         self.timer = QtCore.QTimer(timeout=self.update)
@@ -751,6 +947,61 @@ class GLVisualizer(QOpenGLWidget):
             self.song_font = QtGui.QFont("Consolas", 32)  # Fallback font
         
         logging.debug(f"Using font: {self.song_font.family()}")
+
+    def update_ball_physics_with_collisions(self, delta_ms, inner_radius, outer_radius, amps, bar_data, substeps=4):
+        """Update ball physics with substeps for better high-speed collision detection
+        
+        Args:
+            delta_ms: Time delta in milliseconds
+            inner_radius: Inner radius of ring
+            outer_radius: Outer radius of ring
+            amps: Amplitude array for ring shape collision
+            bar_data: List of (bar_base, bar_tip, angle, bar_velocity) tuples for all bars
+            substeps: Number of physics substeps (higher = more accurate but slower)
+        """
+        dt = delta_ms / 16.0  # Normalize to ~60fps
+        sub_dt = dt / substeps
+        bar_count = self.settings["BAR_COUNT"]
+        
+        for step in range(substeps):
+            # Apply physics for this substep
+            self.ball.vel[1] += self.ball.gravity * sub_dt
+            self.ball.vel *= self.ball.friction ** (1.0 / substeps)
+            self.ball.pos += self.ball.vel * sub_dt
+            
+            # Check collisions after each substep
+            # Ring collision (keep ball contained) - now uses actual wavy ring shape
+            self.ball.collide_with_ring(inner_radius, outer_radius, amps, bar_count)
+            
+            # Bar collisions - find closest bar
+            closest_bar_collision = None
+            closest_bar_dist = float('inf')
+            
+            for bar_base, bar_tip, angle, bar_velocity in bar_data:
+                # Calculate distance to this bar
+                bar_dir = np.array([np.sin(angle), np.cos(angle)])
+                bar_start = bar_dir * bar_base
+                bar_end = bar_dir * bar_tip
+                bar_vec = bar_end - bar_start
+                bar_len_sq = np.dot(bar_vec, bar_vec)
+                
+                if bar_len_sq > 1e-6:
+                    t = max(0, min(1, np.dot(self.ball.pos - bar_start, bar_vec) / bar_len_sq))
+                    closest_point = bar_start + t * bar_vec
+                    dist = np.linalg.norm(self.ball.pos - closest_point)
+                    
+                    # If this bar is closer and would collide, track it
+                    if dist < closest_bar_dist and dist < (self.ball.radius + self.settings["BAR_THICKNESS"] / 2):
+                        closest_bar_dist = dist
+                        closest_bar_collision = (bar_base, bar_tip, angle, bar_velocity)
+            
+            # Apply closest bar collision
+            if closest_bar_collision is not None:
+                bar_base, bar_tip, angle, bar_velocity = closest_bar_collision
+                self.ball.collide_with_bar(bar_base, bar_tip, angle, self.settings["BAR_THICKNESS"], bar_velocity)
+            
+            # Final ring check to ensure containment
+            self.ball.collide_with_ring(inner_radius, outer_radius, amps, bar_count)
 
     def initializeGL(self):
         glEnable(GL_LINE_SMOOTH)
@@ -813,8 +1064,48 @@ class GLVisualizer(QOpenGLWidget):
             self.control, self.error, self.integral = pid_controller(peak_index, self.peak_pid, proportional, 0.0, 0.02, self.error, self.integral, delta/1000)
             self.peak_pid += self.control * delta/1000 # max_fft
 
+        # Update ball physics
+        if self.settings.get("BALL_ENABLED", True):
+            # Don't call ball.update() directly anymore - we'll use substeps
+            
+            # "BOOM" effect - kick ball on sudden volume spikes
+            # Check if there's a sudden loud moment (high PID error)
+            if self.settings.get("BALL_BOOM_ENABLED", True):
+                boom_threshold = self.settings.get("BALL_BOOM_THRESHOLD", 300)
+                if self.processor.error > boom_threshold:
+                    # Apply impulse toward the center with some random variation
+                    # Get direction from ball position to center (0, 0)
+                    to_center = -self.ball.pos  # Vector pointing to center
+                    dist = np.linalg.norm(to_center)
+                    
+                    if dist > 1e-6:
+                        # Normalize direction to center
+                        direction = to_center / dist
+                        
+                        # Add random angular variation (±30 degrees)
+                        variation_angle = np.random.uniform(-np.pi / 6, np.pi / 6)
+                        cos_var = np.cos(variation_angle)
+                        sin_var = np.sin(variation_angle)
+                        
+                        # Rotate direction vector
+                        rotated_x = direction[0] * cos_var - direction[1] * sin_var
+                        rotated_y = direction[0] * sin_var + direction[1] * cos_var
+                        
+                        boom_magnitude = self.processor.error / 50000  # Scale with spike intensity
+                        boom_magnitude = min(boom_magnitude, 0.15)  # Cap maximum kick
+                        
+                        self.ball.vel[0] += rotated_x * boom_magnitude
+                        self.ball.vel[1] += rotated_y * boom_magnitude
+        
         # Draw bars for circular mode or handle rotation for square mode
         if not self.settings["SQUARE_MODE"]:
+            # Collect bar data for collision detection
+            bar_data = []
+            
+            # Ensure previous_bar_values is the right size
+            if len(self.previous_bar_values) != paint_bar_count:
+                self.previous_bar_values = np.zeros(paint_bar_count)
+            
             for i in range(self.animated_bar_count):
                 shifted_index = (i + (self.rotation_offset * paint_bar_count / (2 * np.pi))) % paint_bar_count
 
@@ -825,6 +1116,23 @@ class GLVisualizer(QOpenGLWidget):
                 value = max(value, self.settings["MIN_BAR_HEIGHT"])
                 min_value = max(value, min_value)
                 angle = (2 * np.pi * i) / paint_bar_count + 1.5 * np.pi + self.rotation_offset
+
+                # Calculate bar tip position and velocity
+                bar_base = 0.3 - value * 0.05
+                bar_tip = bar_base + value * 0.5
+                
+                # Calculate previous bar tip position
+                prev_value = self.previous_bar_values[i]
+                prev_bar_base = 0.3 - prev_value * 0.05
+                prev_bar_tip = prev_bar_base + prev_value * 0.5
+                
+                # Bar velocity is the CHANGE IN TIP RADIUS (not amplitude change)
+                bar_velocity = bar_tip - prev_bar_tip
+                self.previous_bar_values[i] = value
+
+                # Collect bar data for collision detection
+                if self.settings.get("BALL_ENABLED", True):
+                    bar_data.append((bar_base, bar_tip, angle, bar_velocity))
 
                 # Scale color value based on the actual displayable range (0 to BAR_MAX_HEIGHT)
                 # This ensures colors reach full range even when max height is limited
@@ -841,6 +1149,11 @@ class GLVisualizer(QOpenGLWidget):
                     self.draw_rounded_polys(angle, value, (0.0, 0.0, 0.0, self.bar_opacity), (self.settings["BAR_THICKNESS"] / 2) + self.settings["OUTLINE_SCALE"] * 0.01)
                 self.draw_rounded_polys(angle, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity), self.settings["BAR_THICKNESS"] / 2)
                 #self.draw_bar(angle, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity))
+            
+            # Now update ball physics with substeps for accurate collision detection
+            if self.settings.get("BALL_ENABLED", True):
+                self.update_ball_physics_with_collisions(delta, inner_radius, outer_radius + 0.03, amps, bar_data, substeps=4)
+        
         lowering = False
         #print(f"min_value: {min_value:.4f}, bar_opacity: {self.bar_opacity:.4f}, animated_bar_count: {self.animated_bar_count}/{paint_bar_count}    ", end="\r")
         if min_value > self.settings["MIN_BAR_HEIGHT"]:
@@ -865,6 +1178,16 @@ class GLVisualizer(QOpenGLWidget):
         # Draw BPM indicator (adjust count based on mode)
         bpm_indicator_count = paint_bar_count if self.settings["SQUARE_MODE"] else ring_bar_count * 2
         self.draw_bpm_indicator(bpm_indicator_count)
+        
+        # Draw ball (only in circular mode for now)
+        if not self.settings["SQUARE_MODE"] and self.settings.get("BALL_ENABLED", True):
+            # Check if ball somehow escaped the inner ring boundary
+            ball_dist = np.linalg.norm(self.ball.pos)
+            if ball_dist > inner_radius + 0.05:  # Give small buffer beyond inner ring
+                self.ball.respawn()
+            
+            self.draw_ball()
+        
         if not lowering or np.min(amps) > self.settings["MIN_BAR_HEIGHT"] / 10:
             if self.animated_bar_count < paint_bar_count:
                 self.animation_counter += 1
@@ -972,6 +1295,41 @@ class GLVisualizer(QOpenGLWidget):
                 y = center_y + pulse_radius * np.sin(angle)
                 glVertex2f(x, y)
             glEnd()
+
+    def draw_ball(self):
+        """Draw the physics ball"""
+        segments = 16  # Circle smoothness
+        
+        # Draw outline if enabled
+        if self.settings["OUTLINE_SCALE"] > 0.1:
+            glColor4f(0.0, 0.0, 0.0, self.bar_opacity)
+            glBegin(GL_POLYGON)
+            for i in range(segments):
+                angle = 2 * np.pi * i / segments
+                x = self.ball.pos[0] + (self.ball.radius + self.settings["OUTLINE_SCALE"] * 0.01) * np.cos(angle)
+                y = self.ball.pos[1] + (self.ball.radius + self.settings["OUTLINE_SCALE"] * 0.01) * np.sin(angle)
+                glVertex2f(x, y)
+            glEnd()
+        
+        # Draw main ball with bright color
+        glColor4f(0.6 * self.bar_opacity, 0.1 * self.bar_opacity, 0.4 * self.bar_opacity, self.bar_opacity)
+        glBegin(GL_POLYGON)
+        for i in range(segments):
+            angle = 2 * np.pi * i / segments
+            x = self.ball.pos[0] + self.ball.radius * np.cos(angle)
+            y = self.ball.pos[1] + self.ball.radius * np.sin(angle)
+            glVertex2f(x, y)
+        glEnd()
+        
+        # Draw velocity indicator (debug visualization)
+        #if np.linalg.norm(self.ball.vel) > 0.001:
+        #    glColor4f(1.0 * self.bar_opacity, 0.0, 0.0, self.bar_opacity * 0.5)
+        #    glLineWidth(2)
+        #    glBegin(GL_LINES)
+        #    glVertex2f(self.ball.pos[0], self.ball.pos[1])
+        #    vel_end = self.ball.pos + self.ball.vel * 5  # Scale for visibility
+        #    glVertex2f(vel_end[0], vel_end[1])
+        #    glEnd()
 
 
     def draw_ring(self, inner_radius, outer_radius, segments, amps, outline=False):
@@ -1617,6 +1975,54 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.settings_manager.settings["AUDIO_ROTATION_SPEED"] < 5.0:
                 self.settings_manager.settings["AUDIO_ROTATION_SPEED"] = round(self.settings_manager.settings["AUDIO_ROTATION_SPEED"] + 0.1, 1)
                 logger.settings(f"Updated AUDIO_ROTATION_SPEED: {self.settings_manager.settings['AUDIO_ROTATION_SPEED']}")
+        elif event.key() == QtCore.Qt.Key_N:
+            # Toggle ball physics
+            self.settings_manager.settings["BALL_ENABLED"] = not self.settings_manager.settings.get("BALL_ENABLED", True)
+            ball_status = "ENABLED" if self.settings_manager.settings["BALL_ENABLED"] else "DISABLED"
+            logger.settings(f"Ball Physics: {ball_status}")
+            if self.settings_manager.settings["BALL_ENABLED"]:
+                # Respawn ball when re-enabled
+                self.visualizer.ball.respawn()
+            self.settings_manager.save_settings_to_file(self.settings_manager.settings)
+        elif event.key() == QtCore.Qt.Key_M:
+            # Reset ball position (drop it)
+            self.visualizer.ball.respawn()
+            logger.info("Ball respawned at center")
+        elif event.key() == QtCore.Qt.Key_J:
+            # Decrease gravity (less downward pull)
+            self.visualizer.ball.gravity = round(self.visualizer.ball.gravity + 0.0001, 4)
+            logger.settings(f"Ball gravity: {self.visualizer.ball.gravity}")
+        elif event.key() == QtCore.Qt.Key_U:
+            # Increase gravity (more downward pull)
+            if self.visualizer.ball.gravity > -0.01:
+                self.visualizer.ball.gravity = round(self.visualizer.ball.gravity - 0.0001, 4)
+                logger.settings(f"Ball gravity: {self.visualizer.ball.gravity}")
+        elif event.key() == QtCore.Qt.Key_H:
+            # Decrease bounce coefficient
+            if self.visualizer.ball.bounce > 0.1:
+                self.visualizer.ball.bounce = round(self.visualizer.ball.bounce - 0.05, 2)
+                logger.settings(f"Ball bounce: {self.visualizer.ball.bounce}")
+        elif event.key() == QtCore.Qt.Key_Y:
+            # Increase bounce coefficient
+            if self.visualizer.ball.bounce < 1.0:
+                self.visualizer.ball.bounce = round(self.visualizer.ball.bounce + 0.05, 2)
+                logger.settings(f"Ball bounce: {self.visualizer.ball.bounce}")
+        elif event.key() == QtCore.Qt.Key_X:
+            # Toggle boom effect
+            self.settings_manager.settings["BALL_BOOM_ENABLED"] = not self.settings_manager.settings.get("BALL_BOOM_ENABLED", True)
+            boom_status = "ENABLED" if self.settings_manager.settings["BALL_BOOM_ENABLED"] else "DISABLED"
+            logger.settings(f"Ball Boom Effect: {boom_status}")
+            self.settings_manager.save_settings_to_file(self.settings_manager.settings)
+        elif event.key() == QtCore.Qt.Key_C:
+            # Decrease boom threshold (more sensitive)
+            if self.settings_manager.settings.get("BALL_BOOM_THRESHOLD", 300) > 50:
+                self.settings_manager.settings["BALL_BOOM_THRESHOLD"] = self.settings_manager.settings.get("BALL_BOOM_THRESHOLD", 300) - 50
+                logger.settings(f"Ball Boom Threshold: {self.settings_manager.settings['BALL_BOOM_THRESHOLD']}")
+        elif event.key() == QtCore.Qt.Key_V:
+            # Increase boom threshold (less sensitive)
+            if self.settings_manager.settings.get("BALL_BOOM_THRESHOLD", 300) < 2000:
+                self.settings_manager.settings["BALL_BOOM_THRESHOLD"] = self.settings_manager.settings.get("BALL_BOOM_THRESHOLD", 300) + 50
+                logger.settings(f"Ball Boom Threshold: {self.settings_manager.settings['BALL_BOOM_THRESHOLD']}")
 
     def update_bpm_display(self):
         """Update the BPM label display"""
@@ -1779,7 +2185,16 @@ class MainWindow(QtWidgets.QMainWindow):
             ",": "Decrease BASE_ROTATION_SPEED (constant rotation)",
             ".": "Increase BASE_ROTATION_SPEED (constant rotation)",
             ";": "Decrease AUDIO_ROTATION_SPEED (audio reactive rotation)",
-            "'": "Increase AUDIO_ROTATION_SPEED (audio reactive rotation)"
+            "'": "Increase AUDIO_ROTATION_SPEED (audio reactive rotation)",
+            "N": "Toggle ball physics on/off",
+            "M": "Respawn/reset ball at center",
+            "J": "Decrease ball gravity (less downward pull)",
+            "U": "Increase ball gravity (more downward pull)",
+            "H": "Decrease ball bounce coefficient (less bouncy)",
+            "Y": "Increase ball bounce coefficient (more bouncy)",
+            "X": "Toggle ball boom effect (volume spike impulse) on/off",
+            "C": "Decrease boom threshold (more sensitive to volume spikes)",
+            "V": "Increase boom threshold (less sensitive to volume spikes)"
         }
         logging.info("Keybinds:")
         for key, desc in keybinds.items():
