@@ -9,7 +9,9 @@ audio_visualizer
 ├── src
 │   ├── pyqt5_audio_visualiser_optimise.py  # Main application code for the audio visualizer
 ├── requirements.txt                  # Project dependencies
-└── README.md                         # Documentation for the project
+├── README.md                         # Documentation for the project
+├── index.html                        # Github pages landing page
+└── Misc build resources and helper functions
 ```
 
 ## Installation
@@ -22,14 +24,24 @@ To set up the project, follow these steps:
    cd audio_visualizer
    ```
 
-2. Install the required dependencies:
+2. Make a new virtual environment (optional):
+   ```
+   python -m venv .venv
+   ```
+
+3. Enter the virtual environment (optional):
+   ```
+   .venv\Scripts\activate.bat
+   ```
+
+4. Install the required dependencies:
    ```
    pip install -r requirements.txt
    ```
 
 ## Usage
 
-To run the audio visualizer, execute the following command:
+To run the audio visualizer, execute the following command from root of the repository:
 
 ```
 python src/pyqt5_audio_visualiser_optimise.py
