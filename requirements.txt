@@ -6,3 +6,6 @@ PyQt5_sip
 sounddevice
 winsdk
 PyAudio
+platformdirs
+pywin32
+pyaudiowpatch
