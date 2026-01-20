@@ -121,6 +121,8 @@ class SettingsManager:
             "BALL_ENABLED": True,  # Toggle physics ball on/off
             "BALL_BOOM_ENABLED": True,  # Toggle "boom" impulse on volume spikes
             "BALL_BOOM_THRESHOLD": 300,  # PID error threshold for boom effect
+            "INCLUDE_MIC_INPUT": False,
+            "MIC_DEVICE": None,
             }
         self.default_settings = self.settings.copy()
 
@@ -292,6 +294,12 @@ class AudioProcessor:
         self.smoothed_amps = np.zeros(self.init_bar_count)
         self.fall_velocity = np.zeros(self.init_bar_count)
         
+        # buffers for optional mixing of WASAPI + mic
+        self.wasapi_buffer = None
+        self.mic_buffer = None
+        self.last_wasapi_ts = 0.0
+        self.last_mic_ts = 0.0
+
         # Initialize audio capture based on settings
         if self.settings.get("USE_SYSTEM_AUDIO", False):
             self.device_index, self.use_wasapi = self.find_wasapi_loopback_device()
@@ -422,23 +430,58 @@ class AudioProcessor:
         logging.warning("No suitable audio input device found")
         return None
 
-    def analyze_chunk(self, indata, frames, time_info, status):
-        # Handle different input formats based on audio source
-        if self.use_wasapi and isinstance(indata, bytes):
-            # PyAudio WASAPI returns bytes, convert to numpy array
-            samples = np.frombuffer(indata, dtype=np.int16).astype(np.float32) / 32768.0
-            # Reshape to stereo if needed
-            if len(samples) % 2 == 0:
-                mono = np.mean(samples.reshape(-1, 2), axis=1)
+    def analyze_chunk(self, indata, frames, time_info, status, source='mic'):
+        """
+        Unified analysis entry. 'source' may be 'wasapi' or 'mic'.
+        When both buffers are available and settings allow, mix them.
+        """
+        try:
+            # Convert incoming data to mono numpy array regardless of origin
+            if source == 'wasapi' and isinstance(indata, (bytes, bytearray)):
+                samples = np.frombuffer(indata, dtype=np.int16).astype(np.float32) / 32768.0
+                if len(samples) % 2 == 0:
+                    mono = np.mean(samples.reshape(-1, 2), axis=1)
+                else:
+                    mono = samples
             else:
-                mono = samples
-        else:
-            # SoundDevice returns numpy array directly
-            mono = np.mean(indata, axis=1) if len(indata.shape) > 1 else indata
-            
-        N = 4096 * 2
-        fft = np.abs(np.fft.rfft(mono, n=N))
-        freqs = np.fft.rfftfreq(N, d=1 / self.settings["SAMPLE_RATE"])
+                arr = np.array(indata)
+                mono = np.mean(arr, axis=1) if arr.ndim > 1 else arr
+
+            now = time.time()
+            if source == 'wasapi':
+                self.wasapi_buffer = mono
+                self.last_wasapi_ts = now
+            elif source == 'mic':
+                self.mic_buffer = mono
+                self.last_mic_ts = now
+
+            mixed = None
+            mix_allowed = self.settings.get("INCLUDE_MIC_INPUT", False)
+            if mix_allowed and self.wasapi_buffer is not None and self.mic_buffer is not None:
+                minlen = min(len(self.wasapi_buffer), len(self.mic_buffer))
+                if minlen > 0:
+                    mixed = (self.wasapi_buffer[:minlen] + self.mic_buffer[:minlen]) * 0.5
+
+            if mixed is None:
+                mono_for_analysis = self.wasapi_buffer if source == 'wasapi' else self.mic_buffer
+            else:
+                mono_for_analysis = mixed
+
+            if mono_for_analysis is None or len(mono_for_analysis) == 0:
+                return
+
+            mono = mono_for_analysis
+            N = 4096 * 2
+            if len(mono) < N:
+                mono = np.pad(mono, (0, N - len(mono)))
+            else:
+                mono = mono[:N]
+
+            fft = np.abs(np.fft.rfft(mono, n=N))
+            freqs = np.fft.rfftfreq(N, d=1 / self.settings["SAMPLE_RATE"])
+        except Exception as e:
+            logging.debug(f"analyze_chunk error: {e}")
+            return
 
         #band_edges = get_weighted_band_edges(settings["MIN_FREQ"], settings["MAX_FREQ"], chunk_bar_count, low_bias=0.8)
         band_edges = get_weighted_band_edges(self.settings["MIN_FREQ"], self.settings["MAX_FREQ"], self.init_bar_count, low_bias=0.8)
@@ -912,6 +955,11 @@ class GLVisualizer(QOpenGLWidget):
         self.elapsed_time = QtCore.QTime.currentTime()
         self.animated_bar_count = settings["BAR_COUNT"]
         self.animation_counter = 0
+        # Fade state: keep smooth transitions between visible and hidden
+        self._fade_state = 1.0  # 1.0 == fully visible, 0.0 == fully faded out
+        self._fade_target = 1.0
+        self._fade_speed = 0.25  # fraction per second for fade (adjust for slower/faster)
+        self._last_fade_update = time.time()
         self.debug_print_delay = 0 # int(1000 / UPDATE_INTERVAL)
         self.control = 0
         self.error = 0
@@ -1154,27 +1202,60 @@ class GLVisualizer(QOpenGLWidget):
             if self.settings.get("BALL_ENABLED", True):
                 self.update_ball_physics_with_collisions(delta, inner_radius, outer_radius + 0.03, amps, bar_data, substeps=4)
         
+        # Fade management: determine fade target based on recent bar activity
         lowering = False
-        #print(f"min_value: {min_value:.4f}, bar_opacity: {self.bar_opacity:.4f}, animated_bar_count: {self.animated_bar_count}/{paint_bar_count}    ", end="\r")
+        now_t = time.time()
+        # If there's a sufficiently loud bar, target full visibility and remember the time
         if min_value > self.settings["MIN_BAR_HEIGHT"]:
-            self.bar_opacity = self.settings["MAX_OPACITY"]
+            self._fade_target = 1.0
             self.last_valid_bar = QtCore.QTime.currentTime()
         else:
+            # If we have a last valid bar time, check how long it's been quiet
             if hasattr(self, 'last_valid_bar'):
                 elapsed = self.last_valid_bar.msecsTo(QtCore.QTime.currentTime()) / 1000.0
-                lowering = True
-                fade_duration = 4
-                if elapsed < fade_duration and elapsed > 0.4:
-                    #self.bar_opacity = MAX_OPACITY * (1 - (elapsed / fade_duration))
-                    self.bar_opacity = self.settings["MAX_OPACITY"] * (1 - max(0, elapsed - fade_duration / 2) / (fade_duration / 2))
-                    self.animated_bar_count = int(paint_bar_count * (1 - max(0, (elapsed - fade_duration / 2) / (fade_duration / 2))))
-                elif 0 <= elapsed <= 0.4:
-                    pass
+                # After quiet for 2 seconds, start fading out
+                fade_wait = 0.4
+                if elapsed >= fade_wait:
+                    lowering = True
+                    self._fade_target = 0.0
                 else:
-                    self.animated_bar_count = 0
-                    self.bar_opacity = 0.0
+                    # still within grace period -> remain visible
+                    self._fade_target = 1.0
             else:
-                pass
+                # no recent bars seen -> begin fading out
+                lowering = True
+                self._fade_target = 0.0
+
+        # Update fade state smoothly based on time delta; clamp to [0,1]
+        dt = max(1e-6, now_t - getattr(self, '_last_fade_update', now_t))
+        self._last_fade_update = now_t
+        # fade speed is fraction per second; compute step
+        step = self._fade_speed * dt
+        if self._fade_state < self._fade_target:
+            self._fade_state = min(self._fade_target, self._fade_state + step)
+        elif self._fade_state > self._fade_target:
+            self._fade_state = max(self._fade_target, self._fade_state - step)
+
+        # Apply fade state to bar_opacity but keep proportional to MAX_OPACITY
+        target_opacity = self.settings["MAX_OPACITY"] * self._fade_state
+        # Smoothly approach target opacity (small easing to avoid jumps)
+        self.bar_opacity += (target_opacity - self.bar_opacity) * 0.5
+
+        # Animate bar count based on fade_state so bars disappear gradually
+        desired_bars = max(0, int(round(paint_bar_count * self._fade_state)))
+        if self.animated_bar_count > desired_bars:
+            # reduce animated bar count gradually
+            self.animated_bar_count = max(desired_bars, self.animated_bar_count - 1)
+        elif self.animated_bar_count < desired_bars:
+            # increase animated bar count gradually (preserve existing paced animation)
+            # Respect the original animation pacing if not currently lowering
+            if not lowering:
+                self.animation_counter += 1
+                if self.animation_counter >= 4:
+                    self.animation_counter = 0
+                    self.animated_bar_count += 1
+            else:
+                self.animated_bar_count = min(desired_bars, self.animated_bar_count + 1)
         # Draw BPM indicator (adjust count based on mode)
         bpm_indicator_count = paint_bar_count if self.settings["SQUARE_MODE"] else ring_bar_count * 2
         self.draw_bpm_indicator(bpm_indicator_count)
@@ -1802,7 +1883,8 @@ class MainWindow(QtWidgets.QMainWindow):
             logging.info(f"Sample rate: {sample_rate}, Channels: {channels}")
             
             def pyaudio_callback(in_data, frame_count, time_info, status):
-                self.processor.analyze_chunk(in_data, frame_count, time_info, status)
+                # Tag source so analyze_chunk can mix when needed
+                self.processor.analyze_chunk(in_data, frame_count, time_info, status, source='wasapi')
                 return (None, pyaudio.paContinue)
             
             self.processor.pyaudio_stream = self.processor.pyaudio_instance.open(
@@ -1817,6 +1899,19 @@ class MainWindow(QtWidgets.QMainWindow):
             
             self.processor.pyaudio_stream.start_stream()
             logging.info("WASAPI loopback stream started successfully")
+            # Optionally start a microphone stream alongside WASAPI
+            if self.settings_manager.settings.get("INCLUDE_MIC_INPUT", False):
+                try:
+                    mic_device = self.settings_manager.settings.get("MIC_DEVICE", None)
+                    self.mic_stream = sd.InputStream(device=mic_device,
+                                                     channels=2,
+                                                     samplerate=self.settings_manager.settings["SAMPLE_RATE"],
+                                                     blocksize=self.settings_manager.settings["CHUNK"],
+                                                     callback=lambda indata, f, t, s: self.processor.analyze_chunk(indata, f, t, s, source='mic'))
+                    self.mic_stream.start()
+                    logging.info("Microphone input stream started alongside WASAPI")
+                except Exception as e:
+                    logging.error(f"Failed to start mic stream alongside WASAPI: {e}")
             
         except Exception as e:
             logging.error(f"Failed to setup WASAPI stream: {e}")
@@ -1826,11 +1921,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def setup_sounddevice_stream(self):
         """Setup regular SoundDevice input stream"""
+        # When only using sounddevice, tag the source as 'mic' for consistency
         self.stream = sd.InputStream(device=self.processor.device_index,
                        channels=2,
                        samplerate=self.settings_manager.settings["SAMPLE_RATE"],
                        blocksize=self.settings_manager.settings["CHUNK"],
-                       callback=self.processor.analyze_chunk)
+                       callback=lambda indata, f, t, s: self.processor.analyze_chunk(indata, f, t, s, source='mic'))
         self.stream.start()
         logging.info("SoundDevice input stream started")
 
@@ -2149,6 +2245,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.processor.pyaudio_stream.close()
                 if self.processor.pyaudio_instance:
                     self.processor.pyaudio_instance.terminate()
+                # close optional mic stream
+                if hasattr(self, 'mic_stream') and self.mic_stream is not None:
+                    try:
+                        if not self.mic_stream.closed:
+                            self.mic_stream.stop()
+                            self.mic_stream.close()
+                    except Exception:
+                        pass
                 logging.info("WASAPI streams closed")
             else:
                 if hasattr(self, 'stream') and not self.stream.closed:

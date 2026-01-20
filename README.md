@@ -205,14 +205,24 @@ This project is licensed under the MIT License.
    cd audio_visualizer
    ```
 
-2. Install the required dependencies:
+2. Make a new virtual environment (optional):
+   ```
+   python -m venv .venv
+   ```
+
+3. Enter the virtual environment (optional):
+   ```
+   .venv\Scripts\activate.bat
+   ```
+
+4. Install the required dependencies:
    ```
    pip install -r requirements.txt
    ```
 
 ## Usage
 
-To run the audio visualizer, execute the following command:
+To run the audio visualizer, execute the following command from root of the repository:
 
 ```
 python src/pyqt5_audio_visualiser_optimise.py
