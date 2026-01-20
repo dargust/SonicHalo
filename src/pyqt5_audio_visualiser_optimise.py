@@ -669,6 +669,11 @@ class GLVisualizer(QOpenGLWidget):
         self.elapsed_time = QtCore.QTime.currentTime()
         self.animated_bar_count = settings["BAR_COUNT"]
         self.animation_counter = 0
+        # Fade state: keep smooth transitions between visible and hidden
+        self._fade_state = 1.0  # 1.0 == fully visible, 0.0 == fully faded out
+        self._fade_target = 1.0
+        self._fade_speed = 0.25  # fraction per second for fade (adjust for slower/faster)
+        self._last_fade_update = time.time()
         self.debug_print_delay = 0 # int(1000 / UPDATE_INTERVAL)
         self.control = 0
         self.error = 0
@@ -794,27 +799,60 @@ class GLVisualizer(QOpenGLWidget):
                     self.draw_rounded_polys(angle, value, (0.0, 0.0, 0.0, self.bar_opacity), (self.settings["BAR_THICKNESS"] / 2) + self.settings["OUTLINE_SCALE"] * 0.01)
                 self.draw_rounded_polys(angle, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity), self.settings["BAR_THICKNESS"] / 2)
                 #self.draw_bar(angle, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity))
+        # Fade management: determine fade target based on recent bar activity
         lowering = False
-        #print(f"min_value: {min_value:.4f}, bar_opacity: {self.bar_opacity:.4f}, animated_bar_count: {self.animated_bar_count}/{paint_bar_count}    ", end="\r")
+        now_t = time.time()
+        # If there's a sufficiently loud bar, target full visibility and remember the time
         if min_value > self.settings["MIN_BAR_HEIGHT"]:
-            self.bar_opacity = self.settings["MAX_OPACITY"]
+            self._fade_target = 1.0
             self.last_valid_bar = QtCore.QTime.currentTime()
         else:
+            # If we have a last valid bar time, check how long it's been quiet
             if hasattr(self, 'last_valid_bar'):
                 elapsed = self.last_valid_bar.msecsTo(QtCore.QTime.currentTime()) / 1000.0
-                lowering = True
-                fade_duration = 4
-                if elapsed < fade_duration and elapsed > 4:
-                    #self.bar_opacity = MAX_OPACITY * (1 - (elapsed / fade_duration))
-                    self.bar_opacity = self.settings["MAX_OPACITY"] * (1 - max(0, elapsed - fade_duration / 2) / (fade_duration / 2))
-                    self.animated_bar_count = int(paint_bar_count * (1 - max(0, (elapsed - fade_duration / 2) / (fade_duration / 2))))
-                elif 0 <= elapsed <= 4:
-                    pass
+                # After quiet for 2 seconds, start fading out
+                fade_wait = 0.4
+                if elapsed >= fade_wait:
+                    lowering = True
+                    self._fade_target = 0.0
                 else:
-                    self.animated_bar_count = 0
-                    self.bar_opacity = 0.0
+                    # still within grace period -> remain visible
+                    self._fade_target = 1.0
             else:
-                pass
+                # no recent bars seen -> begin fading out
+                lowering = True
+                self._fade_target = 0.0
+
+        # Update fade state smoothly based on time delta; clamp to [0,1]
+        dt = max(1e-6, now_t - getattr(self, '_last_fade_update', now_t))
+        self._last_fade_update = now_t
+        # fade speed is fraction per second; compute step
+        step = self._fade_speed * dt
+        if self._fade_state < self._fade_target:
+            self._fade_state = min(self._fade_target, self._fade_state + step)
+        elif self._fade_state > self._fade_target:
+            self._fade_state = max(self._fade_target, self._fade_state - step)
+
+        # Apply fade state to bar_opacity but keep proportional to MAX_OPACITY
+        target_opacity = self.settings["MAX_OPACITY"] * self._fade_state
+        # Smoothly approach target opacity (small easing to avoid jumps)
+        self.bar_opacity += (target_opacity - self.bar_opacity) * 0.5
+
+        # Animate bar count based on fade_state so bars disappear gradually
+        desired_bars = max(0, int(round(paint_bar_count * self._fade_state)))
+        if self.animated_bar_count > desired_bars:
+            # reduce animated bar count gradually
+            self.animated_bar_count = max(desired_bars, self.animated_bar_count - 1)
+        elif self.animated_bar_count < desired_bars:
+            # increase animated bar count gradually (preserve existing paced animation)
+            # Respect the original animation pacing if not currently lowering
+            if not lowering:
+                self.animation_counter += 1
+                if self.animation_counter >= 4:
+                    self.animation_counter = 0
+                    self.animated_bar_count += 1
+            else:
+                self.animated_bar_count = min(desired_bars, self.animated_bar_count + 1)
         # Draw BPM indicator (adjust count based on mode)
         bpm_indicator_count = paint_bar_count if self.settings["SQUARE_MODE"] else ring_bar_count * 2
         self.draw_bpm_indicator(bpm_indicator_count)
