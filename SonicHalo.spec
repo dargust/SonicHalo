@@ -35,6 +35,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version='version.txt',
     icon=['media\\sonic_halo_2.ico'],
     hide_console='minimize-late',
 )
