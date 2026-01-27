@@ -674,7 +674,14 @@ class GLVisualizer(QOpenGLWidget):
         self._fade_target = 1.0
         self._fade_speed = 0.25  # fraction per second for fade (adjust for slower/faster)
         self._last_fade_update = time.time()
+        # Track when the fade target was set to 0.0 so we can require a
+        # continuous quiet period before actually fading down.
+        self._fade_target_set_time = None
+        self._fade_hold = 2.0  # seconds of continuous quiet required before fade-down
         self.debug_print_delay = 0 # int(1000 / UPDATE_INTERVAL)
+        # Per-bar visible timestamps to keep bars present for a short hold
+        # even if their amplitude briefly drops.
+        self.bar_last_visible = [0.0] * self.settings["BAR_COUNT"]
         self.control = 0
         self.error = 0
         self.integral = 0
@@ -810,9 +817,9 @@ class GLVisualizer(QOpenGLWidget):
             # If we have a last valid bar time, check how long it's been quiet
             if hasattr(self, 'last_valid_bar'):
                 elapsed = self.last_valid_bar.msecsTo(QtCore.QTime.currentTime()) / 1000.0
-                # After quiet for 2 seconds, start fading out
-                fade_wait = 0.4
-                if elapsed >= fade_wait:
+                # short grace to avoid tiny gaps being considered quiet
+                short_grace = 0.4
+                if elapsed >= short_grace:
                     lowering = True
                     self._fade_target = 0.0
                 else:
@@ -823,35 +830,84 @@ class GLVisualizer(QOpenGLWidget):
                 lowering = True
                 self._fade_target = 0.0
 
+        # When the target becomes 0.0, record the time; if it flips back to 1.0
+        # reset that timer so the quiet period must be continuous.
+        if self._fade_target == 0.0:
+            if self._fade_target_set_time is None:
+                self._fade_target_set_time = now_t
+        else:
+            # Any noise that sets target back to 1 cancels the fade-down timer
+            self._fade_target_set_time = None
+
         # Update fade state smoothly based on time delta; clamp to [0,1]
         dt = max(1e-6, now_t - getattr(self, '_last_fade_update', now_t))
         self._last_fade_update = now_t
         # fade speed is fraction per second; compute step
         step = self._fade_speed * dt
         if self._fade_state < self._fade_target:
+            # always allow fade-up to proceed smoothly
             self._fade_state = min(self._fade_target, self._fade_state + step)
         elif self._fade_state > self._fade_target:
-            self._fade_state = max(self._fade_target, self._fade_state - step)
+            # Only allow fade-down if the target has been 0.0 for the full
+            # continuous hold period. If the hold timer is not yet set or the
+            # required time hasn't elapsed, do not decrease fade_state.
+            if self._fade_target == 0.0:
+                if self._fade_target_set_time is None:
+                    # This shouldn't normally happen, but guard by setting timer
+                    self._fade_target_set_time = now_t
+                elapsed_target = now_t - self._fade_target_set_time
+                if elapsed_target >= self._fade_hold:
+                    self._fade_state = max(self._fade_target, self._fade_state - step)
+                else:
+                    # keep current fade_state until quiet period completes
+                    pass
+            else:
+                # target > 0 but fade_state greater: allow normal easing
+                self._fade_state = max(self._fade_target, self._fade_state - step)
 
         # Apply fade state to bar_opacity but keep proportional to MAX_OPACITY
         target_opacity = self.settings["MAX_OPACITY"] * self._fade_state
         # Smoothly approach target opacity (small easing to avoid jumps)
         self.bar_opacity += (target_opacity - self.bar_opacity) * 0.5
 
-        # Animate bar count based on fade_state so bars disappear gradually
+        # Update per-bar last-visible timestamps from the smoothed amplitudes
+        for bi in range(min(len(amps), paint_bar_count)):
+            if amps[bi] > self.settings["MIN_BAR_HEIGHT"]:
+                self.bar_last_visible[bi] = now_t
+
+        # Count bars that were recently visible within the hold window
+        recent_active_count = 0
+        for bi in range(paint_bar_count):
+            if (now_t - self.bar_last_visible[bi]) <= self._fade_hold:
+                recent_active_count += 1
+
+        # Animate bar count based on fade_state but never drop below recently active bars
         desired_bars = max(0, int(round(paint_bar_count * self._fade_state)))
+        desired_bars = max(desired_bars, recent_active_count)
+
+        # Decide whether decreases are allowed: only after the fade-down
+        # target has been continuously set for the hold period.
+        allow_decrease = False
+        if self._fade_target == 0.0 and self._fade_target_set_time is not None:
+            if (now_t - self._fade_target_set_time) >= self._fade_hold:
+                allow_decrease = True
+
         if self.animated_bar_count > desired_bars:
-            # reduce animated bar count gradually
-            self.animated_bar_count = max(desired_bars, self.animated_bar_count - 1)
+            # reduce animated bar count gradually, but only if allowed
+            if allow_decrease:
+                self.animated_bar_count = max(desired_bars, self.animated_bar_count - 1)
+            else:
+                # keep current count to avoid bouncing during fade-up
+                pass
         elif self.animated_bar_count < desired_bars:
-            # increase animated bar count gradually (preserve existing paced animation)
-            # Respect the original animation pacing if not currently lowering
+            # increase animated bar count gradually (preserve existing pacing)
             if not lowering:
                 self.animation_counter += 1
                 if self.animation_counter >= 4:
                     self.animation_counter = 0
                     self.animated_bar_count += 1
             else:
+                # when lowering, allow a gentle increase to reach desired_bars
                 self.animated_bar_count = min(desired_bars, self.animated_bar_count + 1)
         # Draw BPM indicator (adjust count based on mode)
         bpm_indicator_count = paint_bar_count if self.settings["SQUARE_MODE"] else ring_bar_count * 2
@@ -862,8 +918,9 @@ class GLVisualizer(QOpenGLWidget):
                 if self.animation_counter >= 4:
                     self.animation_counter = 0
                     self.animated_bar_count += 1
-                #print(self.animated_bar_count / BAR_COUNT)
-                self.bar_opacity = (self.animated_bar_count / paint_bar_count) * self.settings["MAX_OPACITY"]
+                # Do not directly override `bar_opacity` here; allow
+                # `self._fade_state` -> `bar_opacity` smoothing to control
+                # opacity to avoid stepwise jumps when bars are added.
             else:
                 self.animation_counter = 0
         #print(f"{self.animated_bar_count}, {self.animation_counter}, {min_value}, {np.min(amps)}")
