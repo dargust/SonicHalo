@@ -120,6 +120,9 @@ If you prefer manual setup:
 | `T` | Toggle square/circular mode |
 | `Esc` | Exit application |
 
+more controls exist and are listed in the console on run but the basics are here
+colours and audio device input defaults can be set in the config file
+
 ## 🔧 Configuration
 
 Settings are automatically saved in:
