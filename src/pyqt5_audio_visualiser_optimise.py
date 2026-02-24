@@ -992,7 +992,7 @@ class GLVisualizer(QOpenGLWidget):
         self.song_fade_timer.timeout.connect(self._fade_song)
 
         # Profiling helpers
-        self.profiling_enabled = True
+        self.profiling_enabled = False
         self.prof_counters = {"frame": 0}
         self.prof_last_print = time.time()
         self.last_paint_ms = 0.0
@@ -1002,6 +1002,12 @@ class GLVisualizer(QOpenGLWidget):
         self.vbo_quad = None
         self.vbo_circle_count = 0
         self.vbo_quad_count = 0
+        # Batching buffers for rounded bar polygons (per-frame)
+        self._batch_fill = []        # list of numpy-compatible lists [x,y,r,g,b,a,...]
+        self._batch_fill_counts = [] # list of vertex counts per polygon
+        self._batch_outline = []
+        self._batch_outline_counts = []
+        self.vbo_batch = None
 
         # Load pixel font once - FIXED VERSION
         try:
@@ -1270,8 +1276,11 @@ class GLVisualizer(QOpenGLWidget):
                     #blue_offset = max(0,((abs(shifted_index - peak_index)/BAR_COUNT*2)))
                     b += blue_offset
                 if self.settings["OUTLINE_SCALE"] > 0.1:
-                    self.draw_rounded_polys(angle, value, (0.0, 0.0, 0.0, self.bar_opacity), (self.settings["BAR_THICKNESS"] / 2) + self.settings["OUTLINE_SCALE"] * 0.01)
-                self.draw_rounded_polys(angle, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity), self.settings["BAR_THICKNESS"] / 2)
+                    # append outline vertices with black color
+                    col = (0.0, 0.0, 0.0, self.bar_opacity)
+                    self._append_rounded_to_outline(angle, value, col, (self.settings["BAR_THICKNESS"] / 2) + self.settings["OUTLINE_SCALE"] * 0.01)
+                # append fill vertices
+                self._append_rounded_to_fill(angle, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity), self.settings["BAR_THICKNESS"] / 2)
                 #self.draw_bar(angle, value, (r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity))
             
             # Now update ball physics with substeps for accurate collision detection
@@ -1435,6 +1444,9 @@ class GLVisualizer(QOpenGLWidget):
             painter.setPen(color)
             painter.drawText(rect, QtCore.Qt.AlignCenter, self.current_song)
             painter.end()
+
+        # Flush any accumulated rounded-bar batches (outline first, then fill)
+        self.flush_batches()
         # End of paintGL - profiling
         try:
             end = time.perf_counter()
@@ -1770,6 +1782,7 @@ class GLVisualizer(QOpenGLWidget):
             glEnd()
 
     def draw_rounded_polys(self, angle, value, color, radius):
+        # Construct polygon vertices exactly as before, but append into frame batch arrays
         base = 0.3 - value * 0.05
         tip = base + value * 0.5
         dx = radius * np.cos(-angle)
@@ -1798,11 +1811,149 @@ class GLVisualizer(QOpenGLWidget):
             vertices.append((x,y))
         vertices.append(top_left)
 
-        glBegin(GL_POLYGON)
-        glColor4f(*color)
-        for x, y in vertices:
-            glVertex2f(x, y)
-        glEnd()
+        # Append fill vertices to batch with per-vertex color (r,g,b,a)
+        r,g,b,a = color
+        start_index = len(self._batch_fill)
+        for x,y in vertices:
+            self._batch_fill.extend((x, y, r, g, b, a))
+        self._batch_fill_counts.append(len(vertices))
+
+    def _append_rounded_to_fill(self, angle, value, color, radius):
+        # Small wrapper to reuse draw_rounded_polys logic for batching fills
+        base = 0.3 - value * 0.05
+        tip = base + value * 0.5
+        dx = radius * np.cos(-angle)
+        dy = radius * np.sin(-angle)
+        peak_dx = radius * np.cos(-angle) * (1+value*2.25)
+        peak_dy = radius * np.sin(-angle) * (1+value*2.25)
+        peak_radius = radius * (1+value*2)
+        x0, y0 = np.sin(angle) * base, np.cos(angle) * base
+        x1, y1 = np.sin(angle) * tip, np.cos(angle) * tip
+        bottom_left = (x0 - dx, y0 - dy)
+        bottom_right = (x0 + dx, y0 + dy)
+        top_right = (x1 + peak_dx, y1 + peak_dy)
+        top_left = (x1 - peak_dx, y1 - peak_dy)
+        vertices = [bottom_left]
+        for i in range(1,self.arc_point_count-1):
+            theta = np.pi * i / (self.arc_point_count - 1) + np.pi
+            x = x0 + radius * np.cos(theta - angle)
+            y = y0 + radius * np.sin(theta - angle)
+            vertices.append((x,y))
+        vertices.append(bottom_right)
+        vertices.append(top_right)
+        for i in range(1,self.arc_point_count-1):
+            theta = np.pi * i / (self.arc_point_count - 1)
+            x = x1 + (peak_radius) * np.cos(theta - angle)
+            y = y1 + (peak_radius) * np.sin(theta - angle)
+            vertices.append((x,y))
+        vertices.append(top_left)
+        r,g,b,a = color
+        for x,y in vertices:
+            self._batch_fill.extend((x, y, r, g, b, a))
+        self._batch_fill_counts.append(len(vertices))
+
+    def _append_rounded_to_outline(self, angle, value, color, radius):
+        # Append outline vertices similarly
+        base = 0.3 - value * 0.05
+        tip = base + value * 0.5
+        dx = radius * np.cos(-angle)
+        dy = radius * np.sin(-angle)
+        peak_dx = radius * np.cos(-angle) * (1+value*2.25)
+        peak_dy = radius * np.sin(-angle) * (1+value*2.25)
+        peak_radius = radius * (1+value*2)
+        x0, y0 = np.sin(angle) * base, np.cos(angle) * base
+        x1, y1 = np.sin(angle) * tip, np.cos(angle) * tip
+        bottom_left = (x0 - dx, y0 - dy)
+        bottom_right = (x0 + dx, y0 + dy)
+        top_right = (x1 + peak_dx, y1 + peak_dy)
+        top_left = (x1 - peak_dx, y1 - peak_dy)
+        vertices = [bottom_left]
+        for i in range(1,self.arc_point_count-1):
+            theta = np.pi * i / (self.arc_point_count - 1) + np.pi
+            x = x0 + radius * np.cos(theta - angle)
+            y = y0 + radius * np.sin(theta - angle)
+            vertices.append((x,y))
+        vertices.append(bottom_right)
+        vertices.append(top_right)
+        for i in range(1,self.arc_point_count-1):
+            theta = np.pi * i / (self.arc_point_count - 1)
+            x = x1 + (peak_radius) * np.cos(theta - angle)
+            y = y1 + (peak_radius) * np.sin(theta - angle)
+            vertices.append((x,y))
+        vertices.append(top_left)
+        r,g,b,a = color
+        for x,y in vertices:
+            self._batch_outline.extend((x, y, r, g, b, a))
+        self._batch_outline_counts.append(len(vertices))
+
+
+    def flush_batches(self):
+        # Draw outlines first
+        try:
+            # Helper to draw a batch list (interleaved x,y,r,g,b,a) with per-polygon counts
+            def _draw_batch(raw_list, counts, mode=GL_POLYGON):
+                if not raw_list or not counts:
+                    return
+                arr = np.array(raw_list, dtype=np.float32)
+                # arr.shape => (N*6,)
+                vert_count = arr.size // 6
+                arr = arr.reshape((vert_count, 6))
+
+                # Create VBO if needed
+                if self.vbo_batch is None:
+                    try:
+                        self.vbo_batch = glGenBuffers(1)
+                    except Exception:
+                        self.vbo_batch = None
+
+                if self.vbo_batch is not None:
+                    glBindBuffer(GL_ARRAY_BUFFER, self.vbo_batch)
+                    glBufferData(GL_ARRAY_BUFFER, arr.nbytes, None, GL_DYNAMIC_DRAW)
+                    glBufferSubData(GL_ARRAY_BUFFER, 0, arr.nbytes, arr)
+
+                    glEnableClientState(GL_VERTEX_ARRAY)
+                    glEnableClientState(GL_COLOR_ARRAY)
+                    stride = arr.strides[0]
+                    glVertexPointer(2, GL_FLOAT, stride, ctypes.c_void_p(0))
+                    glColorPointer(4, GL_FLOAT, stride, ctypes.c_void_p(8))
+
+                    offset = 0
+                    base = 0
+                    for c in counts:
+                        glDrawArrays(mode, base, c)
+                        base += c
+
+                    glDisableClientState(GL_VERTEX_ARRAY)
+                    glDisableClientState(GL_COLOR_ARRAY)
+                    glBindBuffer(GL_ARRAY_BUFFER, 0)
+                else:
+                    # Fallback: draw per-polygon with immediate mode
+                    idx = 0
+                    for c in counts:
+                        glBegin(mode)
+                        for v in range(c):
+                            x,y,r,g,b,a = arr[idx]
+                            glColor4f(r,g,b,a)
+                            glVertex2f(x,y)
+                            idx += 1
+                        glEnd()
+
+            # Outline
+            if self._batch_outline:
+                _draw_batch(self._batch_outline, self._batch_outline_counts, mode=GL_POLYGON)
+            # Fill
+            if self._batch_fill:
+                _draw_batch(self._batch_fill, self._batch_fill_counts, mode=GL_POLYGON)
+
+        except Exception as e:
+            logging.debug(f"flush_batches error: {e}")
+        finally:
+            # Clear per-frame batches
+            self._batch_fill.clear()
+            self._batch_fill_counts.clear()
+            self._batch_outline.clear()
+            self._batch_outline_counts.clear()
+
 
     def draw_peak_circle(self, optional_marker_freq=None):
         peak_bar_count = self.settings["BAR_COUNT"]
@@ -2534,6 +2685,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             self.mic_stream.close()
                     except Exception:
                         pass
+
+                    pass
                 logging.info("WASAPI streams closed")
             else:
                 if hasattr(self, 'stream') and not self.stream.closed:
