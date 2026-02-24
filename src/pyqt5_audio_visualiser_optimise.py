@@ -991,6 +991,18 @@ class GLVisualizer(QOpenGLWidget):
         self.song_fade_timer = QtCore.QTimer(self)
         self.song_fade_timer.timeout.connect(self._fade_song)
 
+        # Profiling helpers
+        self.profiling_enabled = True
+        self.prof_counters = {"frame": 0}
+        self.prof_last_print = time.time()
+        self.last_paint_ms = 0.0
+
+        # VBO placeholders (created in initializeGL)
+        self.vbo_circle = None
+        self.vbo_quad = None
+        self.vbo_circle_count = 0
+        self.vbo_quad_count = 0
+
         # Load pixel font once - FIXED VERSION
         try:
             font_path = resource_path("media/Px437_IBM_VGA_8x14.ttf")  # Use forward slashes
@@ -1067,6 +1079,56 @@ class GLVisualizer(QOpenGLWidget):
         glEnable(GL_LINE_SMOOTH)
         glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
 
+        # Setup simple VBOs for common unit meshes to avoid per-frame immediate-mode tessellation
+        try:
+            # Unit circle as triangle fan (center + perimeter + repeat first perimeter)
+            segments = 64
+            theta = np.linspace(0, 2 * np.pi, segments, endpoint=False).astype(np.float32)
+            circle = np.empty((segments + 2, 2), dtype=np.float32)
+            circle[0] = (0.0, 0.0)
+            circle[1:segments + 1, 0] = np.cos(theta)
+            circle[1:segments + 1, 1] = np.sin(theta)
+            circle[segments + 1] = circle[1]
+
+            self.vbo_circle = glGenBuffers(1)
+            glBindBuffer(GL_ARRAY_BUFFER, self.vbo_circle)
+            glBufferData(GL_ARRAY_BUFFER, circle.nbytes, circle, GL_STATIC_DRAW)
+            self.vbo_circle_count = segments + 2
+
+            # Unit quad (for future SDF / instanced quads)
+            quad = np.array([[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]], dtype=np.float32)
+            self.vbo_quad = glGenBuffers(1)
+            glBindBuffer(GL_ARRAY_BUFFER, self.vbo_quad)
+            glBufferData(GL_ARRAY_BUFFER, quad.nbytes, quad, GL_STATIC_DRAW)
+            self.vbo_quad_count = 4
+
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+        except Exception as e:
+            logging.debug(f"VBO setup failed: {e}")
+
+        # Preallocate ring buffers and trig lookup to avoid per-frame allocations
+        try:
+            self.ring_max_segments = max(64, int(self.settings.get("ARC_POINT_COUNT", 5) * 32))
+            self._ring_theta = np.linspace(0, 2 * np.pi, self.ring_max_segments + 1, endpoint=False).astype(np.float32)
+            # angles for draw_ring expect a specific sign/offset; precompute cos/sin for full circle
+            self._ring_cos = np.cos(-(2.0 * np.pi * np.arange(self.ring_max_segments + 1) / (self.ring_max_segments)) + np.pi).astype(np.float32)
+            self._ring_sin = np.sin(-(2.0 * np.pi * np.arange(self.ring_max_segments + 1) / (self.ring_max_segments)) + np.pi).astype(np.float32)
+
+            # Preallocated vertex buffer (outer+inner per sample)
+            max_verts = (self.ring_max_segments + 1) * 2
+            self._ring_verts = np.empty((max_verts, 2), dtype=np.float32)
+
+            # Create VBO reserved for dynamic updates
+            try:
+                self.vbo_ring = glGenBuffers(1)
+                glBindBuffer(GL_ARRAY_BUFFER, self.vbo_ring)
+                glBufferData(GL_ARRAY_BUFFER, self._ring_verts.nbytes, None, GL_DYNAMIC_DRAW)
+                glBindBuffer(GL_ARRAY_BUFFER, 0)
+            except Exception:
+                self.vbo_ring = None
+        except Exception as e:
+            logging.debug(f"Ring prealloc failed: {e}")
+
     def resizeGL(self, w, h):
         glViewport(0, 0, w, h)
         glMatrixMode(GL_PROJECTION)
@@ -1077,6 +1139,8 @@ class GLVisualizer(QOpenGLWidget):
 
     def paintGL(self):
         paint_bar_count = self.settings["BAR_COUNT"]
+        # Profiling: measure paintGL time
+        start = time.perf_counter()
         self.debug_print_delay += 1
         new_time = QtCore.QTime.currentTime()
         delta = self.elapsed_time.msecsTo(new_time)
@@ -1371,6 +1435,17 @@ class GLVisualizer(QOpenGLWidget):
             painter.setPen(color)
             painter.drawText(rect, QtCore.Qt.AlignCenter, self.current_song)
             painter.end()
+        # End of paintGL - profiling
+        try:
+            end = time.perf_counter()
+            frame_ms = (end - start) * 1000.0
+            self.last_paint_ms = frame_ms
+            self.prof_counters['frame'] = self.prof_counters.get('frame', 0) + 1
+            if self.profiling_enabled and (time.time() - self.prof_last_print) > 1.0:
+                logging.info(f"paintGL: {frame_ms:.2f} ms")
+                self.prof_last_print = time.time()
+        except Exception:
+            pass
     
     def draw_bpm_indicator(self, segments):
         bpm = self.processor.bpm
@@ -1416,53 +1491,111 @@ class GLVisualizer(QOpenGLWidget):
             pulse_radius = base_radius * (1 + 0.25 * pulse)
             sides = segments  # Hexagon
 
-            # Outline
-            if self.settings["OUTLINE_SCALE"] >= 0.1:
-                glColor4f(0.0, 0.0, 0.0, self.bar_opacity)
+            # Draw using unit-circle VBO (triangle fan) to avoid per-vertex Python calls
+            r, g, b = self.interpolate_hsv_3stop(self.actual_col, self.settings["LOW_COLOUR"], self.settings["MID_COLOUR"], self.settings["HIGH_COLOUR"], self.hsv_to_rgb)
+
+            if self.vbo_circle is not None:
+                # Outline (slightly larger)
+                if self.settings["OUTLINE_SCALE"] >= 0.1:
+                    glColor4f(0.0, 0.0, 0.0, self.bar_opacity)
+                    glPushMatrix()
+                    glTranslatef(center_x, center_y, 0.0)
+                    outline_scale = pulse_radius + self.settings["OUTLINE_SCALE"] * 0.01
+                    glScalef(outline_scale, outline_scale, 1.0)
+                    glBindBuffer(GL_ARRAY_BUFFER, self.vbo_circle)
+                    glEnableClientState(GL_VERTEX_ARRAY)
+                    glVertexPointer(2, GL_FLOAT, 0, ctypes.c_void_p(0))
+                    glDrawArrays(GL_TRIANGLE_FAN, 0, self.vbo_circle_count)
+                    glDisableClientState(GL_VERTEX_ARRAY)
+                    glBindBuffer(GL_ARRAY_BUFFER, 0)
+                    glPopMatrix()
+
+                # Main fill
+                glColor4f(r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity)
+                glPushMatrix()
+                glTranslatef(center_x, center_y, 0.0)
+                glScalef(pulse_radius, pulse_radius, 1.0)
+                glBindBuffer(GL_ARRAY_BUFFER, self.vbo_circle)
+                glEnableClientState(GL_VERTEX_ARRAY)
+                glVertexPointer(2, GL_FLOAT, 0, ctypes.c_void_p(0))
+                glDrawArrays(GL_TRIANGLE_FAN, 0, self.vbo_circle_count)
+                glDisableClientState(GL_VERTEX_ARRAY)
+                glBindBuffer(GL_ARRAY_BUFFER, 0)
+                glPopMatrix()
+            else:
+                # Fallback to immediate mode if VBOs unavailable
+                if self.settings["OUTLINE_SCALE"] >= 0.1:
+                    glColor4f(0.0, 0.0, 0.0, self.bar_opacity)
+                    glBegin(GL_POLYGON)
+                    for i in range(sides):
+                        angle = 2 * np.pi * i / sides
+                        x = center_x + (pulse_radius + self.settings["OUTLINE_SCALE"] * 0.01) * np.cos(angle)
+                        y = center_y + (pulse_radius + self.settings["OUTLINE_SCALE"] * 0.01) * np.sin(angle)
+                        glVertex2f(x, y)
+                    glEnd()
+
+                glColor4f(r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity)
+                glLineWidth(2)
                 glBegin(GL_POLYGON)
                 for i in range(sides):
                     angle = 2 * np.pi * i / sides
-                    x = center_x + (pulse_radius + self.settings["OUTLINE_SCALE"] * 0.01) * np.cos(angle)
-                    y = center_y + (pulse_radius + self.settings["OUTLINE_SCALE"] * 0.01) * np.sin(angle)
+                    x = center_x + pulse_radius * np.cos(angle)
+                    y = center_y + pulse_radius * np.sin(angle)
                     glVertex2f(x, y)
                 glEnd()
 
-            # Set color and alpha (match bar_opacity)
-            r, g, b = self.interpolate_hsv_3stop(self.actual_col, self.settings["LOW_COLOUR"], self.settings["MID_COLOUR"], self.settings["HIGH_COLOUR"], self.hsv_to_rgb)
-            glColor4f(r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity)
-            glLineWidth(2)
-            glBegin(GL_POLYGON)
-            for i in range(sides):
-                angle = 2 * np.pi * i / sides
-                x = center_x + pulse_radius * np.cos(angle)
-                y = center_y + pulse_radius * np.sin(angle)
-                glVertex2f(x, y)
-            glEnd()
-
     def draw_ball(self):
         """Draw the physics ball"""
-        segments = 16  # Circle smoothness
-        
-        # Draw outline if enabled
-        if self.settings["OUTLINE_SCALE"] > 0.1:
-            glColor4f(0.0, 0.0, 0.0, self.bar_opacity)
+        # Draw using precomputed unit-circle VBO if available
+        if self.vbo_circle is not None:
+            # Outline (slightly larger)
+            if self.settings["OUTLINE_SCALE"] > 0.1:
+                glColor4f(0.0, 0.0, 0.0, self.bar_opacity)
+                glPushMatrix()
+                glTranslatef(self.ball.pos[0], self.ball.pos[1], 0.0)
+                glScalef(self.ball.radius + self.settings["OUTLINE_SCALE"] * 0.01, self.ball.radius + self.settings["OUTLINE_SCALE"] * 0.01, 1.0)
+                glBindBuffer(GL_ARRAY_BUFFER, self.vbo_circle)
+                glEnableClientState(GL_VERTEX_ARRAY)
+                glVertexPointer(2, GL_FLOAT, 0, ctypes.c_void_p(0))
+                glDrawArrays(GL_TRIANGLE_FAN, 0, self.vbo_circle_count)
+                glDisableClientState(GL_VERTEX_ARRAY)
+                glBindBuffer(GL_ARRAY_BUFFER, 0)
+                glPopMatrix()
+
+            # Main ball
+            glColor4f(0.6 * self.bar_opacity, 0.1 * self.bar_opacity, 0.4 * self.bar_opacity, self.bar_opacity)
+            glPushMatrix()
+            glTranslatef(self.ball.pos[0], self.ball.pos[1], 0.0)
+            glScalef(self.ball.radius, self.ball.radius, 1.0)
+            glBindBuffer(GL_ARRAY_BUFFER, self.vbo_circle)
+            glEnableClientState(GL_VERTEX_ARRAY)
+            glVertexPointer(2, GL_FLOAT, 0, ctypes.c_void_p(0))
+            glDrawArrays(GL_TRIANGLE_FAN, 0, self.vbo_circle_count)
+            glDisableClientState(GL_VERTEX_ARRAY)
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+            glPopMatrix()
+        else:
+            # Fallback to immediate-mode tessellation
+            segments = 16  # Circle smoothness
+            # Draw outline if enabled
+            if self.settings["OUTLINE_SCALE"] > 0.1:
+                glColor4f(0.0, 0.0, 0.0, self.bar_opacity)
+                glBegin(GL_POLYGON)
+                for i in range(segments):
+                    angle = 2 * np.pi * i / segments
+                    x = self.ball.pos[0] + (self.ball.radius + self.settings["OUTLINE_SCALE"] * 0.01) * np.cos(angle)
+                    y = self.ball.pos[1] + (self.ball.radius + self.settings["OUTLINE_SCALE"] * 0.01) * np.sin(angle)
+                    glVertex2f(x, y)
+                glEnd()
+            # Draw main ball with bright color
+            glColor4f(0.6 * self.bar_opacity, 0.1 * self.bar_opacity, 0.4 * self.bar_opacity, self.bar_opacity)
             glBegin(GL_POLYGON)
             for i in range(segments):
                 angle = 2 * np.pi * i / segments
-                x = self.ball.pos[0] + (self.ball.radius + self.settings["OUTLINE_SCALE"] * 0.01) * np.cos(angle)
-                y = self.ball.pos[1] + (self.ball.radius + self.settings["OUTLINE_SCALE"] * 0.01) * np.sin(angle)
+                x = self.ball.pos[0] + self.ball.radius * np.cos(angle)
+                y = self.ball.pos[1] + self.ball.radius * np.sin(angle)
                 glVertex2f(x, y)
             glEnd()
-        
-        # Draw main ball with bright color
-        glColor4f(0.6 * self.bar_opacity, 0.1 * self.bar_opacity, 0.4 * self.bar_opacity, self.bar_opacity)
-        glBegin(GL_POLYGON)
-        for i in range(segments):
-            angle = 2 * np.pi * i / segments
-            x = self.ball.pos[0] + self.ball.radius * np.cos(angle)
-            y = self.ball.pos[1] + self.ball.radius * np.sin(angle)
-            glVertex2f(x, y)
-        glEnd()
         
         # Draw velocity indicator (debug visualization)
         #if np.linalg.norm(self.ball.vel) > 0.001:
@@ -1477,8 +1610,8 @@ class GLVisualizer(QOpenGLWidget):
 
     def draw_ring(self, inner_radius, outer_radius, segments, amps, outline=False):
         ring_bar_count = self.settings["BAR_COUNT"]
-        glBegin(GL_TRIANGLE_STRIP)
-        #print(self.processor.error)
+
+        # Update color reaction
         if self.processor.error > self.min_max_error[1]:
             self.min_max_error[1] = self.processor.error
         elif self.processor.error < self.min_max_error[0]:
@@ -1488,27 +1621,113 @@ class GLVisualizer(QOpenGLWidget):
         delta = self.actual_col - target_col
         reaction = 0.02 if delta > 0 else 0.3
         self.actual_col -= delta * reaction
-        #print(target_col, self.actual_col)
-        #r, g, b = self.hsv_to_rgb(self.actual_col, 1.0, 1.0) if not outline else (0.0, 0.0, 0.0)
         r, g, b = self.interpolate_hsv_3stop(self.actual_col, self.settings["LOW_COLOUR"], self.settings["MID_COLOUR"], self.settings["HIGH_COLOUR"], self.hsv_to_rgb)
-        if outline:
-            glColor4f(0.0, 0.0, 0.0, self.bar_opacity)
-        else:
-            glColor4f(r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity)
-        for i in range(segments + 1):
-            if i == segments:
-                i = 0
-            angle = -(2 * np.pi * i / segments) + np.pi
-            x = np.cos(angle)
-            y = np.sin(angle)
-            frac = (ring_bar_count / (segments + 1)) * i
-            l_interp = np.sqrt(np.interp(frac, np.arange(len(amps)), amps))
-            l_interp = max(l_interp, self.settings["MIN_BAR_HEIGHT"])
-            # Outer edge vertex
-            glVertex2f(x * (outer_radius + l_interp / 30), y * (outer_radius + l_interp / 30))
-            # Inner edge vertex
-            glVertex2f(x * (inner_radius + l_interp / 30), y * (inner_radius + l_interp / 30))
-        glEnd()
+
+        # Build vertex buffer (triangle strip) once per-frame and upload to dynamic VBO
+        try:
+            seg_count = max(3, int(segments))
+            # Use precomputed trig where possible to avoid sin/cos allocations
+            use_pre = hasattr(self, '_ring_cos') and seg_count <= self.ring_max_segments
+            n = seg_count
+            if use_pre:
+                # Map n evenly into the high-resolution precomputed table and append first sample
+                base_idx = np.floor(np.linspace(0, self.ring_max_segments, n, endpoint=False)).astype(int)
+                cos_base = self._ring_cos[base_idx]
+                sin_base = self._ring_sin[base_idx]
+            else:
+                i_base = np.arange(n, dtype=np.float32)
+                angles_base = -(2.0 * np.pi * i_base / n) + np.pi
+                cos_base = np.cos(angles_base)
+                sin_base = np.sin(angles_base)
+
+            # Map each sample to a fractional index into amps (use n+1 spacing for interpolation)
+            frac = (ring_bar_count / (n + 1)) * np.arange(n, dtype=np.float32)
+            l_interp = np.sqrt(np.interp(frac, np.arange(len(amps), dtype=np.float32), amps.astype(np.float32)))
+            l_interp = np.maximum(l_interp, np.float32(self.settings["MIN_BAR_HEIGHT"]))
+
+            outer_r_base = outer_radius + l_interp / 30.0
+            inner_r_base = inner_radius + l_interp / 30.0
+
+            # Append first element to close the loop
+            cos_a = np.concatenate([cos_base, cos_base[:1]])
+            sin_a = np.concatenate([sin_base, sin_base[:1]])
+            outer_r = np.concatenate([outer_r_base, outer_r_base[:1]])
+            inner_r = np.concatenate([inner_r_base, inner_r_base[:1]])
+
+            # Fill preallocated vertex array (outer, inner interleaved) for n+1 samples
+            nverts = (n + 1) * 2
+            try:
+                verts_view = self._ring_verts[:nverts]
+                verts_view[0::2, 0] = cos_a * outer_r
+                verts_view[0::2, 1] = sin_a * outer_r
+                verts_view[1::2, 0] = cos_a * inner_r
+                verts_view[1::2, 1] = sin_a * inner_r
+
+                # Upload only the used portion
+                if getattr(self, 'vbo_ring', None) is not None:
+                    glBindBuffer(GL_ARRAY_BUFFER, self.vbo_ring)
+                    # Orphan previous buffer storage to avoid GPU/CPU sync stalls
+                    glBufferData(GL_ARRAY_BUFFER, verts_view.nbytes, None, GL_DYNAMIC_DRAW)
+                    glBufferSubData(GL_ARRAY_BUFFER, 0, verts_view.nbytes, verts_view)
+                    glEnableClientState(GL_VERTEX_ARRAY)
+                    glVertexPointer(2, GL_FLOAT, 0, ctypes.c_void_p(0))
+
+                    # Set color
+                    if outline:
+                        glColor4f(0.0, 0.0, 0.0, self.bar_opacity)
+                    else:
+                        glColor4f(r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity)
+
+                    glDrawArrays(GL_TRIANGLE_STRIP, 0, nverts)
+
+                    glDisableClientState(GL_VERTEX_ARRAY)
+                    glBindBuffer(GL_ARRAY_BUFFER, 0)
+                else:
+                    # Fallback: draw using immediate mode from verts_view
+                    if outline:
+                        glColor4f(0.0, 0.0, 0.0, self.bar_opacity)
+                    else:
+                        glColor4f(r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity)
+                    glBegin(GL_TRIANGLE_STRIP)
+                    for j in range(seg_count + 1):
+                        glVertex2f(verts_view[j*2,0], verts_view[j*2,1])
+                        glVertex2f(verts_view[j*2+1,0], verts_view[j*2+1,1])
+                    glEnd()
+            except Exception as e:
+                logging.debug(f"draw_ring vertex fill failed: {e}")
+            else:
+                # Fallback to immediate mode if VBO creation failed
+                if outline:
+                    glColor4f(0.0, 0.0, 0.0, self.bar_opacity)
+                else:
+                    glColor4f(r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity)
+                glBegin(GL_TRIANGLE_STRIP)
+                for j in range(seg_count + 1):
+                    glVertex2f(cos_a[j] * outer_r[j], sin_a[j] * outer_r[j])
+                    glVertex2f(cos_a[j] * inner_r[j], sin_a[j] * inner_r[j])
+                glEnd()
+        except Exception as e:
+            # If anything fails, fall back to original immediate-mode behaviour
+            logging.debug(f"draw_ring dynamic VBO failed: {e}")
+            glBegin(GL_TRIANGLE_STRIP)
+            if outline:
+                glColor4f(0.0, 0.0, 0.0, self.bar_opacity)
+            else:
+                glColor4f(r*self.bar_opacity, g*self.bar_opacity, b*self.bar_opacity, self.bar_opacity)
+            for i in range(segments + 1):
+                if i == segments:
+                    ii = 0
+                else:
+                    ii = i
+                angle = -(2 * np.pi * ii / segments) + np.pi
+                x = np.cos(angle)
+                y = np.sin(angle)
+                frac = (ring_bar_count / (segments + 1)) * ii
+                l_interp = np.sqrt(np.interp(frac, np.arange(len(amps)), amps))
+                l_interp = max(l_interp, self.settings["MIN_BAR_HEIGHT"])
+                glVertex2f(x * (outer_radius + l_interp / 30), y * (outer_radius + l_interp / 30))
+                glVertex2f(x * (inner_radius + l_interp / 30), y * (inner_radius + l_interp / 30))
+            glEnd()
 
     def draw_bar(self, angle, value, color):
         base = 0.3 - value * 0.05
