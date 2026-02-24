@@ -2370,16 +2370,16 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self.display_mode()
                 logger.info("Hiding window border, making trasparent to mouse events")
-        elif event.key() == QtCore.Qt.Key_Down:
-            if self.settings_manager.settings["BAR_COUNT"] > 1:
-                self.settings_manager.settings["BAR_COUNT"] -= 1
-                printed_bar_count = self.settings_manager.settings["BAR_COUNT"]
-                logger.settings(f"Updated BAR_COUNT: {printed_bar_count}")
-        elif event.key() == QtCore.Qt.Key_Up:
-            if self.settings_manager.settings["BAR_COUNT"] < self.max_bar_count:
-                self.settings_manager.settings["BAR_COUNT"] += 1
-                printed_bar_count = self.settings_manager.settings["BAR_COUNT"]
-                logger.settings(f"Updated BAR_COUNT: {printed_bar_count}")
+        #elif event.key() == QtCore.Qt.Key_Down:
+        #    if self.settings_manager.settings["BAR_COUNT"] > 1:
+        #        self.settings_manager.settings["BAR_COUNT"] -= 1
+        #        printed_bar_count = self.settings_manager.settings["BAR_COUNT"]
+        #        logger.settings(f"Updated BAR_COUNT: {printed_bar_count}")
+        #elif event.key() == QtCore.Qt.Key_Up:
+        #    if self.settings_manager.settings["BAR_COUNT"] < self.max_bar_count:
+        #        self.settings_manager.settings["BAR_COUNT"] += 1
+        #        printed_bar_count = self.settings_manager.settings["BAR_COUNT"]
+        #        logger.settings(f"Updated BAR_COUNT: {printed_bar_count}")
         elif event.key() == QtCore.Qt.Key_Left:
             if self.settings_manager.settings["BAR_THICKNESS"] > 0.001:
                 self.settings_manager.settings["BAR_THICKNESS"] = round(self.settings_manager.settings["BAR_THICKNESS"] - 0.001, 3)
@@ -2699,8 +2699,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def log_keybinds():
         keybinds = {
             "P": "Toggle between windowed and display (frameless/clickthrough) mode",
-            "Down Arrow": "Decrease BAR_COUNT (number of bars)",
-            "Up Arrow": "Increase BAR_COUNT (number of bars)",
+            #"Down Arrow": "Decrease BAR_COUNT (number of bars)",
+            #"Up Arrow": "Increase BAR_COUNT (number of bars)",
             "Left Arrow": "Decrease BAR_THICKNESS",
             "Right Arrow": "Increase BAR_THICKNESS",
             "0": "Decrease MAX_OPACITY",
