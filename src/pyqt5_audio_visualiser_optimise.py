@@ -1,4 +1,8 @@
-# refactored_audio_visualizer.py
+##########################################
+# Sonic Halo: Real-Time Audio Visualizer #
+# dan argust 2026                        #
+##########################################
+
 import sys
 import numpy as np
 import sounddevice as sd
@@ -76,9 +80,9 @@ def resource_path(relative_path):
 
 DEBUG = True
 
-logging.info("Sonic Halo: Real-Time Audio Visualizer by Dacus")
+logging.info("Sonic Halo: Real-Time Audio Visualizer by Dan Argust 2026")
 # Major.Minor.Patch.Build
-VERSION = "0.10.1.3"
+VERSION = "0.11.1.1"
 logging.info(f"Version: {VERSION}")
 logging.info(f"System platform: {sys.platform}")
 
@@ -171,7 +175,6 @@ def make_window_clickthrough(window):
     if not ON_WINDOWS:
         logging.warning("Clickthrough windows not yet supported on this platform")
         return
-        
     try:
         hwnd = int(window.winId())
         style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
@@ -185,7 +188,6 @@ def make_window_clickable(window):
     """Make window clickable - Windows only for now"""
     if not ON_WINDOWS:
         return
-        
     try:
         hwnd = int(window.winId())
         style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
@@ -196,6 +198,8 @@ def make_window_clickable(window):
 
 
 def pid_controller(setpoint, pv, kp, ki, kd, previous_error, integral, dt):
+    # Simple PID controller implementation, used for smooth dynamic
+    # maximum volume scaling based on recent peaks
     try:
         error = setpoint - pv
         integral += error * dt
@@ -206,6 +210,7 @@ def pid_controller(setpoint, pv, kp, ki, kd, previous_error, integral, dt):
         return 0.0, 0.0, 0.0
 
 class SongPoller(QtCore.QThread):
+    # Class to poll current song from system media session (Windows WASAPI) and emit signal on change
     song_changed = QtCore.pyqtSignal(str)
 
     def __init__(self, poll_interval=2.0, parent=None):
