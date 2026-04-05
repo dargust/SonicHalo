@@ -77,24 +77,14 @@ class LinuxAudioCapture:
     
     @staticmethod
     def setup_pulseaudio_loopback():
-        """Set up PulseAudio loopback if not present"""
-        try:
-            # Load null sink for loopback
-            subprocess.run(['pactl', 'load-module', 'module-null-sink', 
-                          'sink_name=sonic_halo_null', 'sink_properties=device.description="Sonic_Halo_Null"'], 
-                         check=True, capture_output=True)
-            
-            # Load loopback from null sink monitor to default sink
-            subprocess.run(['pactl', 'load-module', 'module-loopback', 
-                          'source=sonic_halo_null.monitor', 'latency_msec=1'], 
-                         check=True, capture_output=True)
-            
-            logging.info("PulseAudio loopback set up successfully")
-            return True
-            
-        except subprocess.CalledProcessError as e:
-            logging.warning(f"Could not set up PulseAudio loopback: {e}")
-            return False
+        """Use existing PulseAudio/PipeWire monitor sources - no setup needed.
+        
+        PulseAudio and PipeWire already expose a .monitor source for every sink,
+        allowing passive monitoring of audio output without creating new sinks or
+        loopback modules (which would add extra audio channels and disrupt output).
+        """
+        logging.info("Linux audio: using existing monitor sources (no new sinks created)")
+        return True
 
 class MacOSAudioCapture:
     """macOS-specific audio capture utilities"""

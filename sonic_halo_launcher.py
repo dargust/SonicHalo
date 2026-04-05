@@ -92,15 +92,8 @@ def check_dependencies():
 def setup_audio_system():
     """Set up audio system for the current platform"""
     if ON_LINUX:
-        print("Setting up Linux audio system...")
-        try:
-            from cross_platform_audio import setup_system_audio_capture
-            if setup_system_audio_capture():
-                print("✓ Audio system setup complete")
-            else:
-                print("⚠️  Audio system setup failed - using fallback")
-        except ImportError:
-            print("⚠️  Cross-platform audio module not available")
+        print("Linux audio system: using existing monitor sources")
+        print("   PulseAudio/PipeWire monitor sources are used passively - no new sinks created")
     
     elif ON_MACOS:
         print("macOS audio system:")
