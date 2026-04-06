@@ -404,39 +404,108 @@ class AudioProcessor:
         
         # Platform-specific fallbacks
         if ON_LINUX:
-            # Use pactl to find the default sink's monitor source (works on PulseAudio and PipeWire)
-            monitor_name = None
+            # --- Step 1: find the pulse host API index (PortAudio may have ALSA + Pulse) ---
+            pulse_hostapi_idx = None
+            try:
+                for hi, api in enumerate(sd.query_hostapis()):
+                    if 'pulse' in api['name'].lower():
+                        pulse_hostapi_idx = hi
+                        logging.info(f"PulseAudio host API index: {hi} ({api['name']})")
+                        break
+            except Exception:
+                pass
+
+            # Log every available input device for diagnosis
+            logging.info("All sounddevice input devices:")
+            for i, dev in enumerate(devices):
+                if dev['max_input_channels'] > 0:
+                    logging.info(f"  [{i}] hostapi={dev['hostapi']} {dev['name']!r}  "
+                                 f"ch={dev['max_input_channels']}  rate={int(dev['default_samplerate'])}")
+
+            # --- Step 2: identify the best monitor source name via pactl ---
+            # Skip ALSA loopback sinks — find the real hardware/virtual output sink
+            monitor_candidates = []
+            try:
+                # List all sinks; prefer non-loopback ones
+                sinks_result = subprocess.run(['pactl', 'list', 'short', 'sinks'],
+                                              capture_output=True, text=True, timeout=2)
+                if sinks_result.returncode == 0:
+                    sinks = []
+                    for line in sinks_result.stdout.strip().split('\n'):
+                        parts = line.split('\t')
+                        if len(parts) >= 2:
+                            sinks.append(parts[1])
+                    logging.info(f"PulseAudio sinks: {sinks}")
+                    # Prefer sinks that are NOT loopback
+                    hw_sinks = [s for s in sinks if 'loopback' not in s.lower() and 'null' not in s.lower()]
+                    loopback_sinks = [s for s in sinks if s not in hw_sinks]
+                    for s in (hw_sinks or sinks):
+                        monitor_candidates.append(f"{s}.monitor")
+            except Exception as e:
+                logging.debug(f"pactl list sinks failed: {e}")
+
+            # Also add the default sink monitor (may already be in list, but ensures priority)
             try:
                 result = subprocess.run(['pactl', 'get-default-sink'],
                                        capture_output=True, text=True, timeout=2)
                 if result.returncode == 0:
                     default_sink = result.stdout.strip()
-                    if default_sink:
-                        monitor_name = f"{default_sink}.monitor"
-                        logging.info(f"Default sink monitor source: {monitor_name}")
+                    if default_sink and 'loopback' not in default_sink.lower():
+                        default_monitor = f"{default_sink}.monitor"
+                        if default_monitor not in monitor_candidates:
+                            monitor_candidates.insert(0, default_monitor)
+                        logging.info(f"Default sink monitor: {default_monitor}")
             except Exception as e:
                 logging.debug(f"pactl get-default-sink failed: {e}")
 
-            # Try to match the exact monitor name in sounddevice's device list
-            if monitor_name:
+            # Also enumerate all pactl sources directly
+            pactl_sources = []
+            try:
+                src_result = subprocess.run(['pactl', 'list', 'short', 'sources'],
+                                            capture_output=True, text=True, timeout=2)
+                if src_result.returncode == 0:
+                    for line in src_result.stdout.strip().split('\n'):
+                        parts = line.split('\t')
+                        if len(parts) >= 2:
+                            pactl_sources.append(parts[1])
+                    logging.info(f"PulseAudio sources: {pactl_sources}")
+            except Exception as e:
+                logging.debug(f"pactl list sources failed: {e}")
+
+            # --- Step 3: match monitor sources against sounddevice device list ---
+            # Prefer devices in the pulse hostapi if available
+            def _monitor_score(dev_idx, dev):
+                """Lower = better match"""
+                score = 0
+                if pulse_hostapi_idx is not None and dev['hostapi'] != pulse_hostapi_idx:
+                    score += 100  # deprioritise non-pulse devices
+                return score
+
+            for candidate in monitor_candidates:
                 for i, dev in enumerate(devices):
-                    if dev['max_input_channels'] > 0 and monitor_name in dev['name']:
-                        logging.info(f"Using default sink monitor: {dev['name']}")
+                    if dev['max_input_channels'] > 0 and candidate in dev['name']:
+                        logging.info(f"Using monitor device [{i}]: {dev['name']!r}")
                         return i
 
-            # Fallback: any .monitor or 'Monitor of ...' device
+            # Fallback: any .monitor or 'Monitor of ...' device, preferring pulse hostapi
+            matches = []
             for i, dev in enumerate(devices):
                 if dev['max_input_channels'] > 0:
                     name = dev['name']
                     if name.endswith('.monitor') or 'Monitor of' in name:
-                        logging.info(f"Using monitor device: {name}")
-                        return i
+                        matches.append((i, dev))
+            if matches:
+                matches.sort(key=lambda x: _monitor_score(x[0], x[1]))
+                i, dev = matches[0]
+                logging.info(f"Using monitor device [{i}]: {dev['name']!r}")
+                return i
 
-            # If monitor isn't visible via sounddevice (e.g. PortAudio ALSA-only backend),
-            # pass the PulseAudio/PipeWire source name as a string — sounddevice accepts it
-            if monitor_name:
-                logging.info(f"Monitor not in sounddevice list; using name directly: {monitor_name}")
-                return monitor_name
+            # Last resort: if monitor appears in pactl sources but not sounddevice list,
+            # return the name so PortAudio-Pulse can resolve it by name
+            for candidate in monitor_candidates:
+                if candidate in pactl_sources:
+                    logging.info(f"Monitor found in pactl but not sounddevice; opening by name: {candidate!r}")
+                    return candidate
         
         elif ON_MACOS:
             # Look for virtual audio devices
