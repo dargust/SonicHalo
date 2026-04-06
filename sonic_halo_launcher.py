@@ -52,21 +52,21 @@ def check_dependencies():
             warnings.append("Win32 API not available - system tray disabled")
     
     elif ON_LINUX:
-        # Check for PulseAudio
+        # Check for pactl (works for both PulseAudio and PipeWire via compat layer)
         try:
-            result = subprocess.run(['pulseaudio', '--version'], 
-                                  capture_output=True, text=True, check=True)
-            print("✓ PulseAudio available")
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            warnings.append("PulseAudio not found - system audio capture may not work")
-        
-        # Check for pactl
-        try:
-            subprocess.run(['pactl', '--version'], 
+            subprocess.run(['pactl', '--version'],
                           capture_output=True, text=True, check=True)
-            print("✓ pactl available for PulseAudio control")
+            # Also detect whether the backend is PipeWire or PulseAudio
+            try:
+                info = subprocess.run(['pactl', 'info'], capture_output=True, text=True)
+                if 'PipeWire' in info.stdout:
+                    print("✓ PipeWire audio server detected (PulseAudio compat active)")
+                else:
+                    print("✓ PulseAudio available")
+            except Exception:
+                print("✓ pactl available")
         except (subprocess.CalledProcessError, FileNotFoundError):
-            warnings.append("pactl not found - automatic system audio setup disabled")
+            warnings.append("pactl not found - monitor source auto-detection disabled")
     
     elif ON_MACOS:
         warnings.append("macOS: Install BlackHole or Soundflower for system audio capture")

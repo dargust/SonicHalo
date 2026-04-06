@@ -17,7 +17,7 @@ except ImportError:
 from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtWidgets import QOpenGLWidget
 from OpenGL.GL import *
-import ctypes, logging, json, os
+import ctypes, logging, json, os, subprocess
 import platformdirs
 import time
 import asyncio
@@ -404,17 +404,39 @@ class AudioProcessor:
         
         # Platform-specific fallbacks
         if ON_LINUX:
-            # Look for PulseAudio monitor devices
+            # Use pactl to find the default sink's monitor source (works on PulseAudio and PipeWire)
+            monitor_name = None
+            try:
+                result = subprocess.run(['pactl', 'get-default-sink'],
+                                       capture_output=True, text=True, timeout=2)
+                if result.returncode == 0:
+                    default_sink = result.stdout.strip()
+                    if default_sink:
+                        monitor_name = f"{default_sink}.monitor"
+                        logging.info(f"Default sink monitor source: {monitor_name}")
+            except Exception as e:
+                logging.debug(f"pactl get-default-sink failed: {e}")
+
+            # Try to match the exact monitor name in sounddevice's device list
+            if monitor_name:
+                for i, dev in enumerate(devices):
+                    if dev['max_input_channels'] > 0 and monitor_name in dev['name']:
+                        logging.info(f"Using default sink monitor: {dev['name']}")
+                        return i
+
+            # Fallback: any .monitor or 'Monitor of ...' device
             for i, dev in enumerate(devices):
-                if ('pulse' in dev['name'].lower() and 
-                    'monitor' in dev['name'].lower() and 
-                    dev['max_input_channels'] > 0):
-                    logging.info(f"Using PulseAudio monitor device: {dev['name']}")
-                    return i
-                # Also look for .monitor devices
-                if dev['name'].endswith('.monitor') and dev['max_input_channels'] > 0:
-                    logging.info(f"Using monitor device: {dev['name']}")
-                    return i
+                if dev['max_input_channels'] > 0:
+                    name = dev['name']
+                    if name.endswith('.monitor') or 'Monitor of' in name:
+                        logging.info(f"Using monitor device: {name}")
+                        return i
+
+            # If monitor isn't visible via sounddevice (e.g. PortAudio ALSA-only backend),
+            # pass the PulseAudio/PipeWire source name as a string — sounddevice accepts it
+            if monitor_name:
+                logging.info(f"Monitor not in sounddevice list; using name directly: {monitor_name}")
+                return monitor_name
         
         elif ON_MACOS:
             # Look for virtual audio devices
@@ -2353,14 +2375,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def setup_sounddevice_stream(self):
         """Setup regular SoundDevice input stream"""
-        # When only using sounddevice, tag the source as 'mic' for consistency
-        self.stream = sd.InputStream(device=self.processor.device_index,
-                       channels=2,
-                       samplerate=self.settings_manager.settings["SAMPLE_RATE"],
-                       blocksize=self.settings_manager.settings["CHUNK"],
-                       callback=lambda indata, f, t, s: self.processor.analyze_chunk(indata, f, t, s, source='mic'))
-        self.stream.start()
-        logging.info("SoundDevice input stream started")
+        device = self.processor.device_index
+        samplerate = self.settings_manager.settings["SAMPLE_RATE"]
+        blocksize = self.settings_manager.settings["CHUNK"]
+        callback = lambda indata, f, t, s: self.processor.analyze_chunk(indata, f, t, s, source='mic')
+        for channels in (2, 1):
+            try:
+                self.stream = sd.InputStream(device=device,
+                               channels=channels,
+                               samplerate=samplerate,
+                               blocksize=blocksize,
+                               callback=callback)
+                self.stream.start()
+                logging.info(f"SoundDevice input stream started (device={device}, channels={channels})")
+                return
+            except Exception as e:
+                logging.warning(f"Failed to open stream with {channels} channel(s): {e}")
+        logging.error("Could not open audio input stream with 1 or 2 channels")
 
     def keyPressEvent(self, event):
         if event.key() == QtCore.Qt.Key_P:
