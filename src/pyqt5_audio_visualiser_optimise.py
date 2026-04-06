@@ -2376,22 +2376,58 @@ class MainWindow(QtWidgets.QMainWindow):
     def setup_sounddevice_stream(self):
         """Setup regular SoundDevice input stream"""
         device = self.processor.device_index
-        samplerate = self.settings_manager.settings["SAMPLE_RATE"]
+        configured_rate = self.settings_manager.settings["SAMPLE_RATE"]
         blocksize = self.settings_manager.settings["CHUNK"]
         callback = lambda indata, f, t, s: self.processor.analyze_chunk(indata, f, t, s, source='mic')
+
+        # Determine sample rates to try: device native rate first, then configured, then common fallbacks
+        rates_to_try = []
+        try:
+            if isinstance(device, int) and device is not None:
+                dev_info = sd.query_devices(device)
+                native_rate = int(dev_info['default_samplerate'])
+                if native_rate != configured_rate:
+                    rates_to_try.append(native_rate)
+        except Exception:
+            pass
+        rates_to_try.append(configured_rate)
+        for r in (44100, 48000, 96000, 192000):
+            if r not in rates_to_try:
+                rates_to_try.append(r)
+
         for channels in (2, 1):
-            try:
-                self.stream = sd.InputStream(device=device,
-                               channels=channels,
-                               samplerate=samplerate,
-                               blocksize=blocksize,
-                               callback=callback)
-                self.stream.start()
-                logging.info(f"SoundDevice input stream started (device={device}, channels={channels})")
-                return
-            except Exception as e:
-                logging.warning(f"Failed to open stream with {channels} channel(s): {e}")
-        logging.error("Could not open audio input stream with 1 or 2 channels")
+            for rate in rates_to_try:
+                try:
+                    self.stream = sd.InputStream(device=device,
+                                   channels=channels,
+                                   samplerate=rate,
+                                   blocksize=blocksize,
+                                   callback=callback)
+                    self.stream.start()
+                    logging.info(f"SoundDevice stream started (device={device!r}, ch={channels}, rate={rate})")
+                    # Update processor's sample rate if it differs from configured
+                    if rate != configured_rate:
+                        logging.warning(f"Sample rate adjusted from {configured_rate} to {rate} for this device")
+                        self.settings_manager.settings["SAMPLE_RATE"] = rate
+                        self.processor.settings["SAMPLE_RATE"] = rate
+                    return
+                except Exception as e:
+                    logging.debug(f"Stream attempt failed (dev={device!r}, ch={channels}, rate={rate}): {e}")
+
+        # Log all available devices to help diagnose
+        logging.error("Could not open audio input stream. Available sounddevice inputs:")
+        try:
+            for i, dev in enumerate(sd.query_devices()):
+                if dev['max_input_channels'] > 0:
+                    logging.error(f"  [{i}] {dev['name']}  ch={dev['max_input_channels']}  rate={int(dev['default_samplerate'])}")
+        except Exception:
+            pass
+
+        # Last resort: try the system default input device at its native rate
+        if device is not None:
+            logging.warning("Retrying with system default input device")
+            self.processor.device_index = None
+            self.setup_sounddevice_stream()
 
     def keyPressEvent(self, event):
         if event.key() == QtCore.Qt.Key_P:
