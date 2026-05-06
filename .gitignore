@@ -7,3 +7,4 @@ venv_run.bat
 build_run.bat
 *.exe
 *.pyc
+*.webm

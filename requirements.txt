@@ -1,11 +1,8 @@
 numpy
-PyOpenGL
-PyQt5
-PyQt5-Qt5
-PyQt5_sip
 sounddevice
-winsdk
-PyAudio
+PyQt5
+PyOpenGL
 platformdirs
-pywin32
 pyaudiowpatch
+winsdk
+pywin32
